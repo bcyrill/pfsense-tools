@@ -68,6 +68,10 @@ IS ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #define IS_EXT_MODULE
 
+/* packing rule for routing socket */
+#define ROUNDUP(a) \
+	((a) > 0 ? (1 + (((a) - 1) | (sizeof(long) - 1))) : sizeof(long))
+
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
@@ -974,26 +978,31 @@ PHP_FUNCTION(pfSense_ip_to_mac)
 	int mib[6];
 	size_t needed;
 	char *lim, *buf, *next;
+	struct addrinfo hints, *res;
 	struct rt_msghdr *rtm;
-	struct sockaddr_inarp *sin2, addr;
+	struct sockaddr_storage *sin2, addr;
 	struct sockaddr_dl *sdl;
 	char ifname[IF_NAMESIZE];
-	int st, found_entry = 0;
+	int ret_ga, st, found_entry = 0;
 	char outputbuf[128];
 
-        if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s|s", &ip, &ip_len, &rifname, &ifname_len) == FAILURE)
-                RETURN_NULL();
-
-	bzero(&addr, sizeof(addr));
-	if (!inet_pton(AF_INET, ip, &addr.sin_addr.s_addr))
+	if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s|s", &ip, &ip_len, &rifname, &ifname_len) == FAILURE)
 		RETURN_NULL();
-	addr.sin_len = sizeof(addr);
-	addr.sin_family = AF_INET;
+
+	bzero(&hints, sizeof(hints));
+	hints.ai_flags |= AI_NUMERICHOST;
+
+	if ((ret_ga = getaddrinfo(ip, NULL, &hints, &res))) {
+		php_printf("getaddrinfo: %s", gai_strerror(ret_ga));
+		RETURN_NULL();
+	}
+	memcpy(&addr, res->ai_addr, res->ai_addrlen);
+	freeaddrinfo(res);
 
 	mib[0] = CTL_NET;
 	mib[1] = PF_ROUTE;
 	mib[2] = 0;
-	mib[3] = AF_INET;
+	mib[3] = addr.ss_family;
 	mib[4] = NET_RT_FLAGS;
 #ifdef RTF_LLINFO
 	mib[5] = RTF_LLINFO;
@@ -1019,22 +1028,35 @@ PHP_FUNCTION(pfSense_ip_to_mac)
 			break;
 		needed += needed / 8;
 	}
-	if (st == -1)
-		php_printf("actual retrieval of routing table");
+	if (st == -1) /* error during sysctl call */
+		RETURN_NULL();
 	lim = buf + needed;
 	for (next = buf; next < lim; next += rtm->rtm_msglen) {
 		rtm = (struct rt_msghdr *)next;
-		sin2 = (struct sockaddr_inarp *)(rtm + 1);
-		sdl = (struct sockaddr_dl *)((char *)sin2 + SA_SIZE(sin2));
+		sin2 = (struct sockaddr_storage *)(rtm + 1);
+		sdl = (struct sockaddr_dl *)((char *)sin2 + ROUNDUP(sin2->ss_len));
+		if (sdl->sdl_family != AF_LINK)
+			continue;
+		if (!(rtm->rtm_flags & RTF_HOST))
+			continue;
 		if (rifname && if_indextoname(sdl->sdl_index, ifname) &&
 		    strcmp(ifname, rifname))
 			continue;
-		if (addr.sin_addr.s_addr == sin2->sin_addr.s_addr) {
-			found_entry = 1;
+		switch (sin2->ss_family) {
+		case AF_INET:
+			if (((struct sockaddr_inarp *)&addr)->sin_addr.s_addr == ((struct sockaddr_inarp *)sin2)->sin_addr.s_addr)
+				found_entry = 1;
+			break;
+		case AF_INET6:
+			if (IN6_ARE_ADDR_EQUAL(&(((struct sockaddr_in6 *)&addr)->sin6_addr), &(((struct sockaddr_in6 *)sin2)->sin6_addr)))
+				found_entry = 1;
 			break;
 		}
+		if (found_entry == 1)
+			break;
 	}
-	free(buf);
+	if (buf != NULL)
+		free(buf);
 
 	if (found_entry == 0)
 		RETURN_NULL();
