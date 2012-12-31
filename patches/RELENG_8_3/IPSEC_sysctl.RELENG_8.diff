@@ -164,14 +164,6 @@ diff --git a/sys/netinet6/ip6_input.c b/sys/netinet6/ip6_input.c
 index 8250579..875f7ae 100644
 --- a/sys/netinet6/ip6_input.c
 +++ b/sys/netinet6/ip6_input.c
-@@ -125,6 +125,7 @@ static struct netisr_handler ip6_nh = {
- 	.nh_policy = NETISR_POLICY_FLOW,
- };
- 
-+VNET_DECLARE(int, ipipsec_in_use);
- VNET_DECLARE(struct callout, in6_tmpaddrtimer_ch);
- #define	V_in6_tmpaddrtimer_ch		VNET(in6_tmpaddrtimer_ch)
- 
 @@ -921,6 +922,7 @@ passin:
  		}
  
@@ -192,14 +184,6 @@ diff --git a/sys/netinet6/ip6_output.c b/sys/netinet6/ip6_output.c
 index 51441af..20e91e9 100644
 --- a/sys/netinet6/ip6_output.c
 +++ b/sys/netinet6/ip6_output.c
-@@ -138,6 +138,7 @@ static int ip6_getpmtu __P((struct route_in6 *, struct route_in6 *,
- 	struct ifnet *, struct in6_addr *, u_long *, int *));
- static int copypktopts(struct ip6_pktopts *, struct ip6_pktopts *, int);
- 
-+VNET_DECLARE(int, ipipsec_in_use);
- 
- /*
-  * Make an extension header from option data.  hp is the source, and
 @@ -262,15 +263,17 @@ ip6_output(struct mbuf *m0, struct ip6_pktopts *opt,
  	 * FAST IPSEC: We re-injected the packet.
  	 */

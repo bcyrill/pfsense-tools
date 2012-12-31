@@ -1,0 +1,1703 @@
+From: Alexander V. Chernikov <melifaro@FreeBSD.org>
+Date: Tue Apr 24 07:01:35 UTC 2012
+Subject: [PATCH] MFC r232865, r232868, r233478
+
+---
+
+diff --git a/sys/netinet/ip_fw.h b/sys/netinet/ip_fw.h
+index 8fad1ff..69311a7 100644
+--- a/sys/netinet/ip_fw.h
++++ b/sys/netinet/ip_fw.h
+@@ -37,10 +37,10 @@
+ #define	IPFW_DEFAULT_RULE	65535
+ 
+ /*
+- * The number of ipfw tables.  The maximum allowed table number is the
+- * (IPFW_TABLES_MAX - 1).
++ * Default number of ipfw tables.
+  */
+-#define	IPFW_TABLES_MAX		128
++#define	IPFW_TABLES_MAX		65535
++#define	IPFW_TABLES_DEFAULT	128
+ 
+ /*
+  * Most commands (queue, pipe, tag, untag, limit...) can have a 16-bit
+@@ -62,6 +62,19 @@
+  */
+ #define	IPFW_CALLSTACK_SIZE	16
+ 
++/* IP_FW3 header/opcodes */
++typedef struct _ip_fw3_opheader {
++	uint16_t opcode;	/* Operation opcode */
++	uint16_t reserved[3];	/* Align to 64-bit boundary */
++} ip_fw3_opheader;
++
++
++/* IPFW extented tables support */
++#define	IP_FW_TABLE_XADD	86	/* add entry */
++#define	IP_FW_TABLE_XDEL	87	/* delete entry */
++#define	IP_FW_TABLE_XGETSIZE	88	/* get table size */
++#define	IP_FW_TABLE_XLIST	89	/* list table contents */
++
+ /*
+  * The kernel representation of ipfw rules is made of a list of
+  * 'instructions' (for all practical purposes equivalent to BPF
+@@ -568,6 +581,11 @@ struct _ipfw_dyn_rule {
+ /*
+  * These are used for lookup tables.
+  */
++
++#define	IPFW_TABLE_CIDR		1	/* Table for holding IPv4/IPv6 prefixes */
++#define	IPFW_TABLE_INTERFACE	2	/* Table for holding interface names */
++#define	IPFW_TABLE_MAXTYPE	2	/* Maximum valid number */
++
+ typedef struct	_ipfw_table_entry {
+ 	in_addr_t	addr;		/* network address		*/
+ 	u_int32_t	value;		/* value			*/
+@@ -575,6 +593,19 @@ typedef struct	_ipfw_table_entry {
+ 	u_int8_t	masklen;	/* mask length			*/
+ } ipfw_table_entry;
+ 
++typedef struct	_ipfw_table_xentry {
++	uint16_t	len;		/* Total entry length		*/
++	uint8_t		type;		/* entry type			*/
++	uint8_t		masklen;	/* mask length			*/
++	uint16_t	tbl;		/* table number			*/
++	uint32_t	value;		/* value			*/
++	union {
++		/* Longest field needs to be aligned by 4-byte boundary	*/
++		struct in6_addr	addr6;	/* IPv6 address 		*/
++		char	iface[IF_NAMESIZE];	/* interface name	*/
++	} k;
++} ipfw_table_xentry;
++
+ typedef struct	_ipfw_table {
+ 	u_int32_t	size;		/* size of entries in bytes	*/
+ 	u_int32_t	cnt;		/* # of entries			*/
+@@ -582,4 +613,13 @@ typedef struct	_ipfw_table {
+ 	ipfw_table_entry ent[0];	/* entries			*/
+ } ipfw_table;
+ 
++typedef struct	_ipfw_xtable {
++	ip_fw3_opheader	opheader;	/* eXtended tables are controlled via IP_FW3 */
++	uint32_t	size;		/* size of entries in bytes	*/
++	uint32_t	cnt;		/* # of entries			*/
++	uint16_t	tbl;		/* table number			*/
++	uint8_t		type;		/* table type			*/
++	ipfw_table_xentry xent[0];	/* entries			*/
++} ipfw_xtable;
++
+ #endif /* _IPFW2_H */
+diff --git a/sbin/ipfw/ipfw.8 b/sbin/ipfw/ipfw.8
+index ff6a29b..4eb9927 100644
+--- a/sbin/ipfw/ipfw.8
++++ b/sbin/ipfw/ipfw.8
+@@ -1,7 +1,7 @@
+ .\"
+ .\" $FreeBSD$
+ .\"
+-.Dd June 29, 2011
++.Dd March 9, 2012
+ .Dt IPFW 8
+ .Os
+ .Sh NAME
+@@ -1536,7 +1536,7 @@ and they are always printed as hexadecimal (unless the
+ option is used, in which case symbolic resolution will be attempted).
+ .It Cm proto Ar protocol
+ Matches packets with the corresponding IP protocol.
+-.It Cm recv | xmit | via Brq Ar ifX | Ar if Ns Cm * | Ar ipno | Ar any
++.It Cm recv | xmit | via Brq Ar ifX | Ar if Ns Cm * | Ar table Ns Pq Ar number Ns Op , Ns Ar value | Ar ipno | Ar any
+ Matches packets received, transmitted or going through,
+ respectively, the interface specified by exact name
+ .Ns No ( Ar ifX Ns No ),
+@@ -1722,22 +1722,21 @@ connected networks instead of all source addresses.
+ .El
+ .Sh LOOKUP TABLES
+ Lookup tables are useful to handle large sparse sets of
+-addresses or other search keys (e.g. ports, jail IDs).
+-In the rest of this section we will use the term ``address''
+-to mean any unsigned value of up to 32-bit.
+-There may be up to 128 different lookup tables, numbered 0 to 127.
++addresses or other search keys (e.g. ports, jail IDs, interface names).
++In the rest of this section we will use the term ``address''.
++There may be up to 4096 different lookup tables, numbered 0 to 4095.
+ .Pp
+ Each entry is represented by an
+ .Ar addr Ns Op / Ns Ar masklen
+ and will match all addresses with base
+ .Ar addr
+-(specified as an IP address, a hostname or an unsigned integer)
++(specified as an IPv4/IPv6 address, a hostname or an unsigned integer)
+ and mask width of
+ .Ar masklen
+ bits.
+ If
+ .Ar masklen
+-is not specified, it defaults to 32.
++is not specified, it defaults to 32 for IPv4 and 128 for IPv6.
+ When looking up an IP address in a table, the most specific
+ entry will match.
+ Associated with each entry is a 32-bit unsigned
+@@ -1760,7 +1759,8 @@ Internally, each table is stored in a Radix tree, the same way as
+ the routing table (see
+ .Xr route 4 ) .
+ .Pp
+-Lookup tables currently support only ports, jail IDs and IPv4 addresses.
++Lookup tables currently support only ports, jail IDs, IPv4/IPv6  addresses
++and interface names. Wildcards is not supported for interface names.
+ .Pp
+ The
+ .Cm tablearg
+@@ -2564,6 +2564,22 @@ instances.
+ See
+ .Sx SYSCTL VARIABLES 
+ for more info.
++.Sh LOADER TUNABLES 
++Tunables can be set in
++.Xr loader 8
++prompt,
++.Xr loader.conf 5
++or
++.Xr kenv 1
++before ipfw module gets loaded.
++.Bl -tag -width indent
++.It Va net.inet.ip.fw.default_to_accept: No 0
++Defines ipfw last rule behavior. This value overrides
++.Cd "options IPFW_DEFAULT_TO_(ACCEPT|DENY)"
++from kernel configuration file.
++.It Va net.inet.ip.fw.tables_max: No 128
++Defines number of tables available in ipfw. Number cannot exceed 65534.
++.El
+ .Sh SYSCTL VARIABLES
+ A set of
+ .Xr sysctl 8
+@@ -3097,6 +3113,16 @@ action, the table entries may include hostnames and IP addresses.
+ .Dl "ipfw table 1 add 192.168.0.0/27 router1.dmz"
+ .Dl "..."
+ .Dl "ipfw add 100 fwd tablearg ip from any to table(1)"
++.Pp
++In the following example per-interface firewall is created:
++.Pp
++.Dl "ipfw table 10 add vlan20 12000"
++.Dl "ipfw table 10 add vlan30 13000"
++.Dl "ipfw table 20 add vlan20 22000"
++.Dl "ipfw table 20 add vlan30 23000"
++.Dl ".."
++.Dl "ipfw add 100 ipfw skipto tablearg ip from any to any recv 'table(10)' in"
++.Dl "ipfw add 200 ipfw skipto tablearg ip from any to any xmit 'table(10)' out"
+ .Ss SETS OF RULES
+ To add a set of rules atomically, e.g.\& set 18:
+ .Pp
+diff --git a/sbin/ipfw/ipfw2.c b/sbin/ipfw/ipfw2.c
+index c10a86a..518c702 100644
+--- a/sbin/ipfw/ipfw2.c
++++ b/sbin/ipfw/ipfw2.c
+@@ -21,6 +21,7 @@
+  */
+ 
+ #include <sys/types.h>
++#include <sys/param.h>
+ #include <sys/socket.h>
+ #include <sys/sockio.h>
+ #include <sys/sysctl.h>
+@@ -41,6 +42,7 @@
+ #include <timeconv.h>	/* _long_to_time */
+ #include <unistd.h>
+ #include <fcntl.h>
++#include <stddef.h>	/* offsetof */
+ 
+ #include <net/ethernet.h>
+ #include <net/if.h>		/* only IFNAMSIZ */
+@@ -56,6 +58,12 @@ struct cmdline_opts co;	/* global options */
+ 
+ int resvd_set_number = RESVD_SET;
+ 
++int ipfw_socket = -1;
++
++#ifndef s6_addr32
++#define s6_addr32 __u6_addr.__u6_addr32
++#endif
++
+ #define GET_UINT_ARG(arg, min, max, tok, s_x) do {			\
+ 	if (!av[0])							\
+ 		errx(EX_USAGE, "%s: missing argument", match_value(s_x, tok)); \
+@@ -361,33 +369,65 @@ safe_realloc(void *ptr, size_t size)
+ int
+ do_cmd(int optname, void *optval, uintptr_t optlen)
+ {
+-	static int s = -1;	/* the socket */
+ 	int i;
+ 
+ 	if (co.test_only)
+ 		return 0;
+ 
+-	if (s == -1)
+-		s = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+-	if (s < 0)
++	if (ipfw_socket == -1)
++		ipfw_socket = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
++	if (ipfw_socket < 0)
+ 		err(EX_UNAVAILABLE, "socket");
+ 
+ 	if (optname == IP_FW_GET || optname == IP_DUMMYNET_GET ||
+-	    optname == IP_FW_ADD || optname == IP_FW_TABLE_LIST ||
+-	    optname == IP_FW_TABLE_GETSIZE ||
++	    optname == IP_FW_ADD || optname == IP_FW3 ||
+ 	    optname == IP_FW_NAT_GET_CONFIG ||
+ 	    optname < 0 ||
+ 	    optname == IP_FW_NAT_GET_LOG) {
+ 		if (optname < 0)
+ 			optname = -optname;
+-		i = getsockopt(s, IPPROTO_IP, optname, optval,
++		i = getsockopt(ipfw_socket, IPPROTO_IP, optname, optval,
+ 			(socklen_t *)optlen);
+ 	} else {
+-		i = setsockopt(s, IPPROTO_IP, optname, optval, optlen);
++		i = setsockopt(ipfw_socket, IPPROTO_IP, optname, optval, optlen);
+ 	}
+ 	return i;
+ }
+ 
++/*
++ * do_setcmd3 - pass ipfw control cmd to kernel
++ * @optname: option name
++ * @optval: pointer to option data
++ * @optlen: option length
++ *
++ * Function encapsulates option value in IP_FW3 socket option
++ * and calls setsockopt().
++ * Function returns 0 on success or -1 otherwise.
++ */
++int
++do_setcmd3(int optname, void *optval, socklen_t optlen)
++{
++	socklen_t len;
++	ip_fw3_opheader *op3;
++
++	if (co.test_only)
++		return (0);
++
++	if (ipfw_socket == -1)
++		ipfw_socket = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
++	if (ipfw_socket < 0)
++		err(EX_UNAVAILABLE, "socket");
++
++	len = sizeof(ip_fw3_opheader) + optlen;
++	op3 = alloca(len);
++	/* Zero reserved fields */
++	memset(op3, 0, sizeof(ip_fw3_opheader));
++	memcpy(op3 + 1, optval, optlen);
++	op3->opcode = optname;
++
++	return setsockopt(ipfw_socket, IPPROTO_IP, IP_FW3, op3, len);
++}
++
+ /**
+  * match_token takes a table and a string, returns the value associated
+  * with the string (-1 in case of failure).
+@@ -1385,6 +1425,8 @@ show_ipfw(struct ip_fw *rule, int pcwidth, int bcwidth)
+ 				if (cmdif->name[0] == '\0')
+ 					printf(" %s %s", s,
+ 					    inet_ntoa(cmdif->p.ip));
++				else if (cmdif->name[0] == '\1') /* interface table */
++					printf(" %s table(%d)", s, cmdif->p.glob);
+ 				else
+ 					printf(" %s %s", s, cmdif->name);
+ 
+@@ -2304,7 +2346,13 @@ fill_iface(ipfw_insn_if *cmd, char *arg)
+ 	/* Parse the interface or address */
+ 	if (strcmp(arg, "any") == 0)
+ 		cmd->o.len = 0;		/* effectively ignore this command */
+-	else if (!isdigit(*arg)) {
++	else if (strncmp(arg, "table(", 6) == 0) {
++		char *p = strchr(arg + 6, ',');
++		if (p)
++			*p++ = '\0';
++		cmd->name[0] = '\1'; /* Special value indicating table */
++		cmd->p.glob = strtoul(arg + 6, NULL, 0);
++	} else if (!isdigit(*arg)) {
+ 		strlcpy(cmd->name, arg, sizeof(cmd->name));
+ 		cmd->p.glob = strpbrk(arg, "*?[") != NULL ? 1 : 0;
+ 	} else if (!inet_aton(arg, &cmd->p.ip))
+@@ -3772,7 +3820,7 @@ ipfw_flush(int force)
+ }
+ 
+ 
+-static void table_list(ipfw_table_entry ent, int need_header);
++static void table_list(uint16_t num, int need_header);
+ 
+ /*
+  * This one handles all table-related commands
+@@ -3784,12 +3832,12 @@ static void table_list(ipfw_table_entry ent, int need_header);
+ void
+ ipfw_table_handler(int ac, char *av[])
+ {
+-	ipfw_table_entry ent;
++	ipfw_table_xentry xent;
+ 	int do_add;
+ 	int is_all;
+ 	size_t len;
+ 	char *p;
+-	uint32_t a;
++	uint32_t a, type, mask, addrlen;
+ 	uint32_t tables_max;
+ 
+ 	len = sizeof(tables_max);
+@@ -3804,18 +3852,20 @@ ipfw_table_handler(int ac, char *av[])
+ #endif
+ 	}
+ 
++	memset(&xent, 0, sizeof(xent));
++
+ 	ac--; av++;
+ 	if (ac && isdigit(**av)) {
+-		ent.tbl = atoi(*av);
++		xent.tbl = atoi(*av);
+ 		is_all = 0;
+ 		ac--; av++;
+ 	} else if (ac && _substrcmp(*av, "all") == 0) {
+-		ent.tbl = 0;
++		xent.tbl = 0;
+ 		is_all = 1;
+ 		ac--; av++;
+ 	} else
+ 		errx(EX_USAGE, "table number or 'all' keyword required");
+-	if (ent.tbl >= tables_max)
++	if (xent.tbl >= tables_max)
+ 		errx(EX_USAGE, "The table number exceeds the maximum allowed "
+ 			"value (%d)", tables_max - 1);
+ 	NEED1("table needs command");
+@@ -3828,104 +3878,181 @@ ipfw_table_handler(int ac, char *av[])
+ 		do_add = **av == 'a';
+ 		ac--; av++;
+ 		if (!ac)
+-			errx(EX_USAGE, "IP address required");
+-		p = strchr(*av, '/');
+-		if (p) {
+-			*p++ = '\0';
+-			ent.masklen = atoi(p);
+-			if (ent.masklen > 32)
+-				errx(EX_DATAERR, "bad width ``%s''", p);
+-		} else
+-			ent.masklen = 32;
+-		if (lookup_host(*av, (struct in_addr *)&ent.addr) != 0)
+-			errx(EX_NOHOST, "hostname ``%s'' unknown", *av);
++			errx(EX_USAGE, "address required");
++		/* 
++		 * Let's try to guess type by agrument.
++		 * Possible types: 
++		 * 1) IPv4[/mask]
++		 * 2) IPv6[/mask]
++		 * 3) interface name
++		 * 4) port ?
++		 */
++		type = 0;
++		if (ishexnumber(*av[0])) {
++			/* Remove / if exists */
++			if ((p = strchr(*av, '/')) != NULL) {
++				*p = '\0';
++				mask = atoi(p + 1);
++			}
++
++			if (inet_pton(AF_INET, *av, &xent.k.addr6) == 1) {
++				type = IPFW_TABLE_CIDR;
++				if ((p != NULL) && (mask > 32))
++					errx(EX_DATAERR, "bad IPv4 mask width: %s", p + 1);
++				xent.masklen = p ? mask : 32;
++				addrlen = sizeof(struct in_addr);
++			} else if (inet_pton(AF_INET6, *av, &xent.k.addr6) == 1) {
++				type = IPFW_TABLE_CIDR;
++				if ((p != NULL) && (mask > 128))
++					errx(EX_DATAERR, "bad IPv6 mask width: %s", p + 1);
++				xent.masklen = p ? mask : 128;
++				addrlen = sizeof(struct in6_addr);
++			}
++		}
++
++		if ((type == 0) && (strchr(*av, '.') == NULL)) {
++			/* Assume interface name. Copy significant data only */
++			mask = MIN(strlen(*av), IF_NAMESIZE - 1);
++			memcpy(xent.k.iface, *av, mask);
++			/* Set mask to exact match */
++			xent.masklen = 8 * IF_NAMESIZE;
++			type = IPFW_TABLE_INTERFACE;
++			addrlen = IF_NAMESIZE;
++		}
++
++		if (type == 0) {
++			if (lookup_host(*av, (struct in_addr *)&xent.k.addr6) != 0)
++				errx(EX_NOHOST, "hostname ``%s'' unknown", *av);
++			xent.masklen = 32;
++			type = IPFW_TABLE_CIDR;
++			addrlen = sizeof(struct in_addr);
++		}
++
++		xent.type = type;
++		xent.len = offsetof(ipfw_table_xentry, k) + addrlen;
++
+ 		ac--; av++;
+ 		if (do_add && ac) {
+ 			unsigned int tval;
+ 			/* isdigit is a bit of a hack here.. */
+ 			if (strchr(*av, (int)'.') == NULL && isdigit(**av))  {
+-				ent.value = strtoul(*av, NULL, 0);
++				xent.value = strtoul(*av, NULL, 0);
+ 			} else {
+ 				if (lookup_host(*av, (struct in_addr *)&tval) == 0) {
+ 					/* The value must be stored in host order	 *
+ 					 * so that the values < 65k can be distinguished */
+-		       			ent.value = ntohl(tval);
++		       			xent.value = ntohl(tval);
+ 				} else {
+ 					errx(EX_NOHOST, "hostname ``%s'' unknown", *av);
+ 				}
+ 			}
+ 		} else
+-			ent.value = 0;
+-		if (do_cmd(do_add ? IP_FW_TABLE_ADD : IP_FW_TABLE_DEL,
+-		    &ent, sizeof(ent)) < 0) {
++			xent.value = 0;
++		if (do_setcmd3(do_add ? IP_FW_TABLE_XADD : IP_FW_TABLE_XDEL,
++		    &xent, xent.len) < 0) {
+ 			/* If running silent, don't bomb out on these errors. */
+ 			if (!(co.do_quiet && (errno == (do_add ? EEXIST : ESRCH))))
+ 				err(EX_OSERR, "setsockopt(IP_FW_TABLE_%s)",
+-				    do_add ? "ADD" : "DEL");
++				    do_add ? "XADD" : "XDEL");
+ 			/* In silent mode, react to a failed add by deleting */
+ 			if (do_add) {
+-				do_cmd(IP_FW_TABLE_DEL, &ent, sizeof(ent));
+-				if (do_cmd(IP_FW_TABLE_ADD,
+-				    &ent, sizeof(ent)) < 0)
++				do_setcmd3(IP_FW_TABLE_XDEL, &xent, xent.len);
++				if (do_setcmd3(IP_FW_TABLE_XADD, &xent, xent.len) < 0)
+ 					err(EX_OSERR,
+-					    "setsockopt(IP_FW_TABLE_ADD)");
++					    "setsockopt(IP_FW_TABLE_XADD)");
+ 			}
+ 		}
+ 	} else if (_substrcmp(*av, "flush") == 0) {
+-		a = is_all ? tables_max : (uint32_t)(ent.tbl + 1);
++		a = is_all ? tables_max : (uint32_t)(xent.tbl + 1);
+ 		do {
+-			if (do_cmd(IP_FW_TABLE_FLUSH, &ent.tbl,
+-			    sizeof(ent.tbl)) < 0)
++			if (do_cmd(IP_FW_TABLE_FLUSH, &xent.tbl,
++			    sizeof(xent.tbl)) < 0)
+ 				err(EX_OSERR, "setsockopt(IP_FW_TABLE_FLUSH)");
+-		} while (++ent.tbl < a);
++		} while (++xent.tbl < a);
+ 	} else if (_substrcmp(*av, "list") == 0) {
+-		a = is_all ? tables_max : (uint32_t)(ent.tbl + 1);
++		a = is_all ? tables_max : (uint32_t)(xent.tbl + 1);
+ 		do {
+-			table_list(ent, is_all);
+-		} while (++ent.tbl < a);
++			table_list(xent.tbl, is_all);
++		} while (++xent.tbl < a);
+ 	} else
+ 		errx(EX_USAGE, "invalid table command %s", *av);
+ }
+ 
+ static void
+-table_list(ipfw_table_entry ent, int need_header)
++table_list(uint16_t num, int need_header)
+ {
+-	ipfw_table *tbl;
++	ipfw_xtable *tbl;
++	ipfw_table_xentry *xent;
+ 	socklen_t l;
+-	uint32_t a;
+-
+-	a = ent.tbl;
+-	l = sizeof(a);
+-	if (do_cmd(IP_FW_TABLE_GETSIZE, &a, (uintptr_t)&l) < 0)
+-		err(EX_OSERR, "getsockopt(IP_FW_TABLE_GETSIZE)");
++	uint32_t *a, sz, tval;
++	char tbuf[128];
++	struct in6_addr *addr6;
++	ip_fw3_opheader *op3;
++
++	/* Prepend value with IP_FW3 header */
++	l = sizeof(ip_fw3_opheader) + sizeof(uint32_t);
++	op3 = alloca(l);
++	/* Zero reserved fields */
++	memset(op3, 0, sizeof(ip_fw3_opheader));
++	a = (uint32_t *)(op3 + 1);
++	*a = num;
++	op3->opcode = IP_FW_TABLE_XGETSIZE;
++	if (do_cmd(IP_FW3, op3, (uintptr_t)&l) < 0)
++		err(EX_OSERR, "getsockopt(IP_FW_TABLE_XGETSIZE)");
+ 
+ 	/* If a is zero we have nothing to do, the table is empty. */
+-	if (a == 0)
++	if (*a == 0)
+ 		return;
+ 
+-	l = sizeof(*tbl) + a * sizeof(ipfw_table_entry);
++	l = *a;
+ 	tbl = safe_calloc(1, l);
+-	tbl->tbl = ent.tbl;
+-	if (do_cmd(IP_FW_TABLE_LIST, tbl, (uintptr_t)&l) < 0)
+-		err(EX_OSERR, "getsockopt(IP_FW_TABLE_LIST)");
++	tbl->opheader.opcode = IP_FW_TABLE_XLIST;
++	tbl->tbl = num;
++	if (do_cmd(IP_FW3, tbl, (uintptr_t)&l) < 0)
++		err(EX_OSERR, "getsockopt(IP_FW_TABLE_XLIST)");
+ 	if (tbl->cnt && need_header)
+ 		printf("---table(%d)---\n", tbl->tbl);
+-	for (a = 0; a < tbl->cnt; a++) {
+-		unsigned int tval;
+-		tval = tbl->ent[a].value;
+-		if (co.do_value_as_ip) {
+-			char tbuf[128];
+-			strncpy(tbuf, inet_ntoa(*(struct in_addr *)
+-				&tbl->ent[a].addr), 127);
+-			/* inet_ntoa expects network order */
+-			tval = htonl(tval);
+-			printf("%s/%u %s\n", tbuf, tbl->ent[a].masklen,
+-				inet_ntoa(*(struct in_addr *)&tval));
+-		} else {
+-			printf("%s/%u %u\n",
+-				inet_ntoa(*(struct in_addr *)&tbl->ent[a].addr),
+-				tbl->ent[a].masklen, tval);
++	sz = tbl->size - sizeof(ipfw_xtable);
++	xent = &tbl->xent[0];
++	while (sz > 0) {
++		switch (tbl->type) {
++		case IPFW_TABLE_CIDR:
++			/* IPv4 or IPv6 prefixes */
++			tval = xent->value;
++			addr6 = &xent->k.addr6;
++
++			if ((addr6->s6_addr32[0] == 0) && (addr6->s6_addr32[1] == 0) && 
++			    (addr6->s6_addr32[2] == 0)) {
++				/* IPv4 address */
++				inet_ntop(AF_INET, &addr6->s6_addr32[3], tbuf, sizeof(tbuf));
++			} else {
++				/* IPv6 address */
++				inet_ntop(AF_INET6, addr6, tbuf, sizeof(tbuf));
++			}
++
++			if (co.do_value_as_ip) {
++				tval = htonl(tval);
++				printf("%s/%u %s\n", tbuf, xent->masklen,
++				    inet_ntoa(*(struct in_addr *)&tval));
++			} else
++				printf("%s/%u %u\n", tbuf, xent->masklen, tval);
++			break;
++		case IPFW_TABLE_INTERFACE:
++			/* Interface names */
++			tval = xent->value;
++			if (co.do_value_as_ip) {
++				tval = htonl(tval);
++				printf("%s %s\n", xent->k.iface,
++				    inet_ntoa(*(struct in_addr *)&tval));
++			} else
++				printf("%s %u\n", xent->k.iface, tval);
+ 		}
++
++		if (sz < xent->len)
++			break;
++		sz -= xent->len;
++		xent = (void *)xent + xent->len;
+ 	}
++
+ 	free(tbl);
+ }
+diff --git a/sys/netinet/ipfw/ip_fw2.c b/sys/netinet/ipfw/ip_fw2.c
+index 79c974d..0d41564 100644
+--- a/sys/netinet/ipfw/ip_fw2.c
++++ b/sys/netinet/ipfw/ip_fw2.c
+@@ -114,6 +114,10 @@ static int default_to_accept;
+ 
+ VNET_DEFINE(int, autoinc_step);
+ 
++VNET_DEFINE(unsigned int, fw_tables_max);
++/* Use 128 tables by default */
++static unsigned int default_fw_tables = IPFW_TABLES_DEFAULT;
++
+ /*
+  * Each rule belongs to one of 32 different sets (0..31).
+  * The variable set_disable contains one bit per set.
+@@ -143,7 +147,7 @@ ipfw_nat_cfg_t *ipfw_nat_get_log_ptr;
+ 
+ #ifdef SYSCTL_NODE
+ uint32_t dummy_def = IPFW_DEFAULT_RULE;
+-uint32_t dummy_tables_max = IPFW_TABLES_MAX;
++static int sysctl_ipfw_table_num(SYSCTL_HANDLER_ARGS);
+ 
+ SYSBEGIN(f3)
+ 
+@@ -163,13 +167,14 @@ SYSCTL_VNET_INT(_net_inet_ip_fw, OID_AUTO, verbose_limit,
+ SYSCTL_UINT(_net_inet_ip_fw, OID_AUTO, default_rule, CTLFLAG_RD,
+     &dummy_def, 0,
+     "The default/max possible rule number.");
+-SYSCTL_UINT(_net_inet_ip_fw, OID_AUTO, tables_max, CTLFLAG_RD,
+-    &dummy_tables_max, 0,
+-    "The maximum number of tables.");
++SYSCTL_VNET_PROC(_net_inet_ip_fw, OID_AUTO, tables_max,
++    CTLTYPE_UINT|CTLFLAG_RW, 0, 0, sysctl_ipfw_table_num, "IU",
++    "Maximum number of tables");
+ SYSCTL_INT(_net_inet_ip_fw, OID_AUTO, default_to_accept, CTLFLAG_RDTUN,
+     &default_to_accept, 0,
+     "Make the default rule accept all packets.");
+ TUNABLE_INT("net.inet.ip.fw.default_to_accept", &default_to_accept);
++TUNABLE_INT("net.inet.ip.fw.tables_max", &default_fw_tables);
+ SYSCTL_VNET_INT(_net_inet_ip_fw, OID_AUTO, static_count,
+     CTLFLAG_RD, &VNET_NAME(layer3_chain.n_rules), 0,
+     "Number of static rules");
+@@ -339,12 +344,15 @@ tcpopts_match(struct tcphdr *tcp, ipfw_insn *cmd)
+ }
+ 
+ static int
+-iface_match(struct ifnet *ifp, ipfw_insn_if *cmd)
++iface_match(struct ifnet *ifp, ipfw_insn_if *cmd, struct ip_fw_chain *chain, uint32_t *tablearg)
+ {
+ 	if (ifp == NULL)	/* no iface with this packet, match fails */
+ 		return 0;
+ 	/* Check by name or by IP address */
+ 	if (cmd->name[0] != '\0') { /* match by name */
++		if (cmd->name[0] == '\1') /* use tablearg to match */
++			return ipfw_lookup_table_extended(chain, cmd->p.glob,
++				ifp->if_xname, tablearg, IPFW_TABLE_INTERFACE);
+ 		/* Check name */
+ 		if (cmd->p.glob) {
+ 			if (fnmatch(cmd->name, ifp->if_xname, 0) == 0)
+@@ -1287,16 +1295,18 @@ do {								\
+ 
+ 			case O_RECV:
+ 				match = iface_match(m->m_pkthdr.rcvif,
+-				    (ipfw_insn_if *)cmd);
++				    (ipfw_insn_if *)cmd, chain, &tablearg);
+ 				break;
+ 
+ 			case O_XMIT:
+-				match = iface_match(oif, (ipfw_insn_if *)cmd);
++				match = iface_match(oif, (ipfw_insn_if *)cmd,
++				    chain, &tablearg);
+ 				break;
+ 
+ 			case O_VIA:
+ 				match = iface_match(oif ? oif :
+-				    m->m_pkthdr.rcvif, (ipfw_insn_if *)cmd);
++				    m->m_pkthdr.rcvif, (ipfw_insn_if *)cmd,
++				    chain, &tablearg);
+ 				break;
+ 
+ 			case O_MACADDR2:
+@@ -1426,6 +1436,17 @@ do {								\
+ 					    ((ipfw_insn_u32 *)cmd)->d[0] == v;
+ 				    else
+ 					tablearg = v;
++				} else if (is_ipv6) {
++					uint32_t v = 0;
++					void *pkey = (cmd->opcode == O_IP_DST_LOOKUP) ?
++						&args->f_id.dst_ip6: &args->f_id.src_ip6;
++					match = ipfw_lookup_table_extended(chain,
++							cmd->arg1, pkey, &v,
++							IPFW_TABLE_CIDR);
++					if (cmdlen == F_INSN_SIZE(ipfw_insn_u32))
++						match = ((ipfw_insn_u32 *)cmd)->d[0] == v;
++					if (match)
++						tablearg = v;
+ 				}
+ 				break;
+ 
+@@ -2375,6 +2396,26 @@ pullup_failed:
+ }
+ 
+ /*
++ * Set maximum number of tables that can be used in given VNET ipfw instance.
++ */
++#ifdef SYSCTL_NODE
++static int
++sysctl_ipfw_table_num(SYSCTL_HANDLER_ARGS)
++{
++	int error;
++	unsigned int ntables;
++
++	ntables = V_fw_tables_max;
++
++	error = sysctl_handle_int(oidp, &ntables, 0, req);
++	/* Read operation or some error */
++	if ((error != 0) || (req->newptr == NULL))
++		return (error);
++
++	return (ipfw_resize_tables(&V_layer3_chain, ntables));
++}
++#endif
++/*
+  * Module and VNET glue
+  */
+ 
+@@ -2430,6 +2471,10 @@ ipfw_init(void)
+ 		printf("limited to %d packets/entry by default\n",
+ 		    V_verbose_limit);
+ 
++	/* Check user-supplied table count for validness */
++	if (default_fw_tables > IPFW_TABLES_MAX)
++	  default_fw_tables = IPFW_TABLES_MAX;
++
+ 	ipfw_log_bpf(1); /* init */
+ 	return (error);
+ }
+@@ -2475,19 +2520,18 @@ vnet_ipfw_init(const void *unused)
+ 	/* insert the default rule and create the initial map */
+ 	chain->n_rules = 1;
+ 	chain->static_len = sizeof(struct ip_fw);
+-	chain->map = malloc(sizeof(struct ip_fw *), M_IPFW, M_NOWAIT | M_ZERO);
++	chain->map = malloc(sizeof(struct ip_fw *), M_IPFW, M_WAITOK | M_ZERO);
+ 	if (chain->map)
+-		rule = malloc(chain->static_len, M_IPFW, M_NOWAIT | M_ZERO);
+-	if (rule == NULL) {
+-		if (chain->map)
+-			free(chain->map, M_IPFW);
+-		printf("ipfw2: ENOSPC initializing default rule "
+-			"(support disabled)\n");
+-		return (ENOSPC);
+-	}
++		rule = malloc(chain->static_len, M_IPFW, M_WAITOK | M_ZERO);
++
++	/* Set initial number of tables */
++	V_fw_tables_max = default_fw_tables;
+ 	error = ipfw_init_tables(chain);
+ 	if (error) {
+-		panic("init_tables"); /* XXX Marko fix this ! */
++		printf("ipfw2: setting up tables failed\n");
++		free(chain->map, M_IPFW);
++		free(rule, M_IPFW);
++		return (ENOSPC);
+ 	}
+ 
+ 	/* fill and insert the default rule */
+@@ -2550,12 +2594,12 @@ vnet_ipfw_uninit(const void *unused)
+ 	IPFW_UH_WLOCK(chain);
+ 
+ 	IPFW_WLOCK(chain);
++	ipfw_dyn_uninit(0);	/* run the callout_drain */
+ 	IPFW_WUNLOCK(chain);
+-	IPFW_WLOCK(chain);
+ 
+-	ipfw_dyn_uninit(0);	/* run the callout_drain */
+ 	ipfw_destroy_tables(chain);
+ 	reap = NULL;
++	IPFW_WLOCK(chain);
+ 	for (i = 0; i < chain->n_rules; i++) {
+ 		rule = chain->map[i];
+ 		rule->x_next = reap;
+diff --git a/sys/netinet/ipfw/ip_fw_private.h b/sys/netinet/ipfw/ip_fw_private.h
+index 79ad0b4..b91c154 100644
+--- a/sys/netinet/ipfw/ip_fw_private.h
++++ b/sys/netinet/ipfw/ip_fw_private.h
+@@ -208,6 +208,9 @@ VNET_DECLARE(u_int32_t, set_disable);
+ VNET_DECLARE(int, autoinc_step);
+ #define V_autoinc_step		VNET(autoinc_step)
+ 
++VNET_DECLARE(unsigned int, fw_tables_max);
++#define V_fw_tables_max		VNET(fw_tables_max)
++
+ struct ip_fw_chain {
+ 	struct ip_fw	*rules;		/* list of rules */
+ 	struct ip_fw	*reap;		/* list of rules to reap */
+@@ -216,7 +219,9 @@ struct ip_fw_chain {
+ 	int		static_len;	/* total len of static rules */
+ 	struct ip_fw    **map;	/* array of rule ptrs to ease lookup */
+ 	LIST_HEAD(nat_list, cfg_nat) nat;       /* list of nat entries */
+-	struct radix_node_head *tables[IPFW_TABLES_MAX];
++	struct radix_node_head **tables;	/* IPv4 tables */
++	struct radix_node_head **xtables;	/* extended tables */
++	uint8_t		*tabletype;	/* Array of table types */
+ #if defined( __linux__ ) || defined( _WIN32 )
+ 	spinlock_t rwmtx;
+ 	spinlock_t uh_lock;
+@@ -272,16 +277,21 @@ int ipfw_check_hook(void *arg, struct mbuf **m0, struct ifnet *ifp, int dir,
+ struct radix_node;
+ int ipfw_lookup_table(struct ip_fw_chain *ch, uint16_t tbl, in_addr_t addr,
+     uint32_t *val);
++int ipfw_lookup_table_extended(struct ip_fw_chain *ch, uint16_t tbl, void *paddr,
++    uint32_t *val, int type);
+ int ipfw_init_tables(struct ip_fw_chain *ch);
+ void ipfw_destroy_tables(struct ip_fw_chain *ch);
+ int ipfw_flush_table(struct ip_fw_chain *ch, uint16_t tbl);
+-int ipfw_add_table_entry(struct ip_fw_chain *ch, uint16_t tbl, in_addr_t addr,
+-    uint8_t mlen, uint32_t value);
+-int ipfw_dump_table_entry(struct radix_node *rn, void *arg);
+-int ipfw_del_table_entry(struct ip_fw_chain *ch, uint16_t tbl, in_addr_t addr,
+-    uint8_t mlen);
++int ipfw_add_table_entry(struct ip_fw_chain *ch, uint16_t tbl, void *paddr,
++    uint8_t plen, uint8_t mlen, uint8_t type, uint32_t value);
++int ipfw_del_table_entry(struct ip_fw_chain *ch, uint16_t tbl, void *paddr,
++    uint8_t plen, uint8_t mlen, uint8_t type);
+ int ipfw_count_table(struct ip_fw_chain *ch, uint32_t tbl, uint32_t *cnt);
++int ipfw_dump_table_entry(struct radix_node *rn, void *arg);
+ int ipfw_dump_table(struct ip_fw_chain *ch, ipfw_table *tbl);
++int ipfw_count_xtable(struct ip_fw_chain *ch, uint32_t tbl, uint32_t *cnt);
++int ipfw_dump_xtable(struct ip_fw_chain *ch, ipfw_xtable *tbl);
++int ipfw_resize_tables(struct ip_fw_chain *ch, unsigned int ntables);
+ 
+ /* In ip_fw_nat.c -- XXX to be moved to ip_var.h */
+ 
+diff --git a/sys/netinet/ipfw/ip_fw_sockopt.c b/sys/netinet/ipfw/ip_fw_sockopt.c
+index 86103be..52180a0 100644
+--- a/sys/netinet/ipfw/ip_fw_sockopt.c
++++ b/sys/netinet/ipfw/ip_fw_sockopt.c
+@@ -667,7 +667,6 @@ check_ipfw_struct(struct ip_fw *rule, int size)
+ 			    cmdlen != F_INSN_SIZE(ipfw_insn_u32))
+ 				goto bad_size;
+ 			break;
+-
+ 		case O_MACADDR2:
+ 			if (cmdlen != F_INSN_SIZE(ipfw_insn_mac))
+ 				goto bad_size;
+@@ -929,6 +928,7 @@ ipfw_getrules(struct ip_fw_chain *chain, void *buf, size_t space)
+ }
+ 
+ 
++#define IP_FW3_OPLENGTH(x)	((x)->sopt_valsize - sizeof(ip_fw3_opheader))
+ /**
+  * {set|get}sockopt parser.
+  */
+@@ -937,10 +937,13 @@ ipfw_ctl(struct sockopt *sopt)
+ {
+ #define	RULE_MAXSIZE	(256*sizeof(u_int32_t))
+ 	int error;
+-	size_t size;
++	size_t size, len, valsize;
+ 	struct ip_fw *buf, *rule;
+ 	struct ip_fw_chain *chain;
+ 	u_int32_t rulenum[2];
++	uint32_t opt;
++	char xbuf[128];
++	ip_fw3_opheader *op3 = NULL;
+ 
+ 	error = priv_check(sopt->sopt_td, PRIV_NETINET_IPFW);
+ 	if (error)
+@@ -960,7 +963,21 @@ ipfw_ctl(struct sockopt *sopt)
+ 	chain = &V_layer3_chain;
+ 	error = 0;
+ 
+-	switch (sopt->sopt_name) {
++	/* Save original valsize before it is altered via sooptcopyin() */
++	valsize = sopt->sopt_valsize;
++	if ((opt = sopt->sopt_name) == IP_FW3) {
++		/* 
++		 * Copy not less than sizeof(ip_fw3_opheader).
++		 * We hope any IP_FW3 command will fit into 128-byte buffer.
++		 */
++		if ((error = sooptcopyin(sopt, xbuf, sizeof(xbuf),
++			sizeof(ip_fw3_opheader))) != 0)
++			return (error);
++		op3 = (ip_fw3_opheader *)xbuf;
++		opt = op3->opcode;
++	}
++
++	switch (opt) {
+ 	case IP_FW_GET:
+ 		/*
+ 		 * pass up a copy of the current rules. Static rules
+@@ -1099,7 +1116,8 @@ ipfw_ctl(struct sockopt *sopt)
+ 			if (error)
+ 				break;
+ 			error = ipfw_add_table_entry(chain, ent.tbl,
+-			    ent.addr, ent.masklen, ent.value);
++			    &ent.addr, sizeof(ent.addr), ent.masklen, 
++			    IPFW_TABLE_CIDR, ent.value);
+ 		}
+ 		break;
+ 
+@@ -1112,7 +1130,34 @@ ipfw_ctl(struct sockopt *sopt)
+ 			if (error)
+ 				break;
+ 			error = ipfw_del_table_entry(chain, ent.tbl,
+-			    ent.addr, ent.masklen);
++			    &ent.addr, sizeof(ent.addr), ent.masklen, IPFW_TABLE_CIDR);
++		}
++		break;
++
++	case IP_FW_TABLE_XADD: /* IP_FW3 */
++	case IP_FW_TABLE_XDEL: /* IP_FW3 */
++		{
++			ipfw_table_xentry *xent = (ipfw_table_xentry *)(op3 + 1);
++
++			/* Check minimum header size */
++			if (IP_FW3_OPLENGTH(sopt) < offsetof(ipfw_table_xentry, k)) {
++				error = EINVAL;
++				break;
++			}
++
++			/* Check if len field is valid */
++			if (xent->len > sizeof(ipfw_table_xentry)) {
++				error = EINVAL;
++				break;
++			}
++			
++			len = xent->len - offsetof(ipfw_table_xentry, k);
++
++			error = (opt == IP_FW_TABLE_XADD) ?
++				ipfw_add_table_entry(chain, xent->tbl, &xent->k, 
++					len, xent->masklen, xent->type, xent->value) :
++				ipfw_del_table_entry(chain, xent->tbl, &xent->k,
++					len, xent->masklen, xent->type);
+ 		}
+ 		break;
+ 
+@@ -1124,9 +1169,7 @@ ipfw_ctl(struct sockopt *sopt)
+ 			    sizeof(tbl), sizeof(tbl));
+ 			if (error)
+ 				break;
+-			IPFW_WLOCK(chain);
+ 			error = ipfw_flush_table(chain, tbl);
+-			IPFW_WUNLOCK(chain);
+ 		}
+ 		break;
+ 
+@@ -1175,6 +1218,62 @@ ipfw_ctl(struct sockopt *sopt)
+ 		}
+ 		break;
+ 
++	case IP_FW_TABLE_XGETSIZE: /* IP_FW3 */
++		{
++			uint32_t *tbl;
++
++			if (IP_FW3_OPLENGTH(sopt) < sizeof(uint32_t)) {
++				error = EINVAL;
++				break;
++			}
++
++			tbl = (uint32_t *)(op3 + 1);
++
++			IPFW_RLOCK(chain);
++			error = ipfw_count_xtable(chain, *tbl, tbl);
++			IPFW_RUNLOCK(chain);
++			if (error)
++				break;
++			error = sooptcopyout(sopt, op3, sopt->sopt_valsize);
++		}
++		break;
++
++	case IP_FW_TABLE_XLIST: /* IP_FW3 */
++		{
++			ipfw_xtable *tbl;
++
++			if ((size = valsize) < sizeof(ipfw_xtable)) {
++				error = EINVAL;
++				break;
++			}
++
++			tbl = malloc(size, M_TEMP, M_ZERO | M_WAITOK);
++			memcpy(tbl, op3, sizeof(ipfw_xtable));
++
++			/* Get maximum number of entries we can store */
++			tbl->size = (size - sizeof(ipfw_xtable)) /
++			    sizeof(ipfw_table_xentry);
++			IPFW_RLOCK(chain);
++			error = ipfw_dump_xtable(chain, tbl);
++			IPFW_RUNLOCK(chain);
++			if (error) {
++				free(tbl, M_TEMP);
++				break;
++			}
++
++			/* Revert size field back to bytes */
++			tbl->size = tbl->size * sizeof(ipfw_table_xentry) +
++				sizeof(ipfw_table);
++			/* 
++			 * Since we call sooptcopyin() with small buffer, sopt_valsize is
++			 * decreased to reflect supplied buffer size. Set it back to original value
++			 */
++			sopt->sopt_valsize = valsize;
++			error = sooptcopyout(sopt, tbl, size);
++			free(tbl, M_TEMP);
++		}
++		break;
++
+ 	/*--- NAT operations are protected by the IPFW_LOCK ---*/
+ 	case IP_FW_NAT_CFG:
+ 		if (IPFW_NAT_LOADED)
+diff --git a/sys/netinet/ipfw/ip_fw_table.c b/sys/netinet/ipfw/ip_fw_table.c
+index 6a1c8e0..764b413 100644
+--- a/sys/netinet/ipfw/ip_fw_table.c
++++ b/sys/netinet/ipfw/ip_fw_table.c
+@@ -76,6 +76,29 @@ struct table_entry {
+ 	u_int32_t		value;
+ };
+ 
++struct xaddr_iface {
++	uint8_t		if_len;		/* length of this struct */
++	uint8_t		pad[7];		/* Align name */
++	char 		ifname[IF_NAMESIZE];	/* Interface name */
++};
++
++struct table_xentry {
++	struct radix_node	rn[2];
++	union {
++#ifdef INET6
++		struct sockaddr_in6	addr6;
++#endif
++		struct xaddr_iface	iface;
++	} a;
++	union {
++#ifdef INET6
++		struct sockaddr_in6	mask6;
++#endif
++		struct xaddr_iface	ifmask;
++	} m;
++	u_int32_t		value;
++};
++
+ /*
+  * The radix code expects addr and mask to be array of bytes,
+  * with the first byte being the length of the array. rn_inithead
+@@ -87,57 +110,275 @@ struct table_entry {
+  */
+ #define KEY_LEN(v)	*((uint8_t *)&(v))
+ #define KEY_OFS		(8*offsetof(struct sockaddr_in, sin_addr))
++/*
++ * Do not require radix to compare more than actual IPv4/IPv6 address
++ */
++#define KEY_LEN_INET	(offsetof(struct sockaddr_in, sin_addr) + sizeof(in_addr_t))
++#define KEY_LEN_INET6	(offsetof(struct sockaddr_in6, sin6_addr) + sizeof(struct in6_addr))
++#define KEY_LEN_IFACE	(offsetof(struct xaddr_iface, ifname))
++
++#define OFF_LEN_INET	(8 * offsetof(struct sockaddr_in, sin_addr))
++#define OFF_LEN_INET6	(8 * offsetof(struct sockaddr_in6, sin6_addr))
++#define OFF_LEN_IFACE	(8 * offsetof(struct xaddr_iface, ifname))
++
++
++static inline void
++ipv6_writemask(struct in6_addr *addr6, uint8_t mask)
++{
++	uint32_t *cp;
++
++	for (cp = (uint32_t *)addr6; mask >= 32; mask -= 32)
++		*cp++ = 0xFFFFFFFF;
++	*cp = htonl(mask ? ~((1 << (32 - mask)) - 1) : 0);
++}
+ 
+ int
+-ipfw_add_table_entry(struct ip_fw_chain *ch, uint16_t tbl, in_addr_t addr,
+-    uint8_t mlen, uint32_t value)
++ipfw_add_table_entry(struct ip_fw_chain *ch, uint16_t tbl, void *paddr,
++    uint8_t plen, uint8_t mlen, uint8_t type, uint32_t value)
+ {
+-	struct radix_node_head *rnh;
++	struct radix_node_head *rnh, **rnh_ptr;
+ 	struct table_entry *ent;
++	struct table_xentry *xent;
+ 	struct radix_node *rn;
++	in_addr_t addr;
++	int offset;
++	void *ent_ptr;
++	struct sockaddr *addr_ptr, *mask_ptr;
++	char c;
+ 
+-	if (tbl >= IPFW_TABLES_MAX)
++	if (tbl >= V_fw_tables_max)
+ 		return (EINVAL);
+-	rnh = ch->tables[tbl];
+-	ent = malloc(sizeof(*ent), M_IPFW_TBL, M_NOWAIT | M_ZERO);
+-	if (ent == NULL)
+-		return (ENOMEM);
+-	ent->value = value;
+-	KEY_LEN(ent->addr) = KEY_LEN(ent->mask) = 8;
+-	ent->mask.sin_addr.s_addr = htonl(mlen ? ~((1 << (32 - mlen)) - 1) : 0);
+-	ent->addr.sin_addr.s_addr = addr & ent->mask.sin_addr.s_addr;
++
++	switch (type) {
++	case IPFW_TABLE_CIDR:
++		if (plen == sizeof(in_addr_t)) {
++#ifdef INET
++			ent = malloc(sizeof(*ent), M_IPFW_TBL, M_WAITOK | M_ZERO);
++			ent->value = value;
++			/* Set 'total' structure length */
++			KEY_LEN(ent->addr) = KEY_LEN_INET;
++			KEY_LEN(ent->mask) = KEY_LEN_INET;
++			/* Set offset of IPv4 address in bits */
++			offset = OFF_LEN_INET;
++			ent->mask.sin_addr.s_addr = htonl(mlen ? ~((1 << (32 - mlen)) - 1) : 0);
++			addr = *((in_addr_t *)paddr);
++			ent->addr.sin_addr.s_addr = addr & ent->mask.sin_addr.s_addr;
++			/* Set pointers */
++			rnh_ptr = &ch->tables[tbl];
++			ent_ptr = ent;
++			addr_ptr = (struct sockaddr *)&ent->addr;
++			mask_ptr = (struct sockaddr *)&ent->mask;
++#endif
++#ifdef INET6
++		} else if (plen == sizeof(struct in6_addr)) {
++			/* IPv6 case */
++			if (mlen > 128)
++				return (EINVAL);
++			xent = malloc(sizeof(*xent), M_IPFW_TBL, M_WAITOK | M_ZERO);
++			xent->value = value;
++			/* Set 'total' structure length */
++			KEY_LEN(xent->a.addr6) = KEY_LEN_INET6;
++			KEY_LEN(xent->m.mask6) = KEY_LEN_INET6;
++			/* Set offset of IPv6 address in bits */
++			offset = OFF_LEN_INET6;
++			ipv6_writemask(&xent->m.mask6.sin6_addr, mlen);
++			memcpy(&xent->a.addr6.sin6_addr, paddr, sizeof(struct in6_addr));
++			APPLY_MASK(&xent->a.addr6.sin6_addr, &xent->m.mask6.sin6_addr);
++			/* Set pointers */
++			rnh_ptr = &ch->xtables[tbl];
++			ent_ptr = xent;
++			addr_ptr = (struct sockaddr *)&xent->a.addr6;
++			mask_ptr = (struct sockaddr *)&xent->m.mask6;
++#endif
++		} else {
++			/* Unknown CIDR type */
++			return (EINVAL);
++		}
++		break;
++	
++	case IPFW_TABLE_INTERFACE:
++		/* Check if string is terminated */
++		c = ((char *)paddr)[IF_NAMESIZE - 1];
++		((char *)paddr)[IF_NAMESIZE - 1] = '\0';
++		if (((mlen = strlen((char *)paddr)) == IF_NAMESIZE - 1) && (c != '\0'))
++			return (EINVAL);
++
++		/* Include last \0 into comparison */
++		mlen++;
++
++		xent = malloc(sizeof(*xent), M_IPFW_TBL, M_WAITOK | M_ZERO);
++		xent->value = value;
++		/* Set 'total' structure length */
++		KEY_LEN(xent->a.iface) = KEY_LEN_IFACE + mlen;
++		KEY_LEN(xent->m.ifmask) = KEY_LEN_IFACE + mlen;
++		/* Set offset of interface name in bits */
++		offset = OFF_LEN_IFACE;
++		memcpy(xent->a.iface.ifname, paddr, mlen);
++		/* Assume direct match */
++		/* TODO: Add interface pattern matching */
++#if 0
++		memset(xent->m.ifmask.ifname, 0xFF, IF_NAMESIZE);
++		mask_ptr = (struct sockaddr *)&xent->m.ifmask;
++#endif
++		/* Set pointers */
++		rnh_ptr = &ch->xtables[tbl];
++		ent_ptr = xent;
++		addr_ptr = (struct sockaddr *)&xent->a.iface;
++		mask_ptr = NULL;
++		break;
++
++	default:
++		return (EINVAL);
++	}
++
+ 	IPFW_WLOCK(ch);
+-	rn = rnh->rnh_addaddr(&ent->addr, &ent->mask, rnh, (void *)ent);
+-	if (rn == NULL) {
++
++	/* Check if tabletype is valid */
++	if ((ch->tabletype[tbl] != 0) && (ch->tabletype[tbl] != type)) {
+ 		IPFW_WUNLOCK(ch);
+-		free(ent, M_IPFW_TBL);
+-		return (EEXIST);
++		free(ent_ptr, M_IPFW_TBL);
++		return (EINVAL);
+ 	}
++
++	/* Check if radix tree exists */
++	if ((rnh = *rnh_ptr) == NULL) {
++		IPFW_WUNLOCK(ch);
++		/* Create radix for a new table */
++		if (!rn_inithead((void **)&rnh, offset)) {
++			free(ent_ptr, M_IPFW_TBL);
++			return (ENOMEM);
++		}
++
++		IPFW_WLOCK(ch);
++		if (*rnh_ptr != NULL) {
++			/* Tree is already attached by other thread */
++			rn_detachhead((void **)&rnh);
++			rnh = *rnh_ptr;
++			/* Check table type another time */
++			if (ch->tabletype[tbl] != type) {
++				IPFW_WUNLOCK(ch);
++				free(ent_ptr, M_IPFW_TBL);
++				return (EINVAL);
++			}
++		} else {
++			*rnh_ptr = rnh;
++			/* 
++			 * Set table type. It can be set already
++			 * (if we have IPv6-only table) but setting
++			 * it another time does not hurt
++			 */
++			ch->tabletype[tbl] = type;
++		}
++	}
++
++	rn = rnh->rnh_addaddr(addr_ptr, mask_ptr, rnh, ent_ptr);
+ 	IPFW_WUNLOCK(ch);
++
++	if (rn == NULL) {
++		free(ent_ptr, M_IPFW_TBL);
++		return (EEXIST);
++	}
+ 	return (0);
+ }
+ 
+ int
+-ipfw_del_table_entry(struct ip_fw_chain *ch, uint16_t tbl, in_addr_t addr,
+-    uint8_t mlen)
++ipfw_del_table_entry(struct ip_fw_chain *ch, uint16_t tbl, void *paddr,
++    uint8_t plen, uint8_t mlen, uint8_t type)
+ {
+-	struct radix_node_head *rnh;
++	struct radix_node_head *rnh, **rnh_ptr;
+ 	struct table_entry *ent;
++	in_addr_t addr;
+ 	struct sockaddr_in sa, mask;
++	struct sockaddr *sa_ptr, *mask_ptr;
++	char c;
+ 
+-	if (tbl >= IPFW_TABLES_MAX)
++	if (tbl >= V_fw_tables_max)
+ 		return (EINVAL);
+-	rnh = ch->tables[tbl];
+-	KEY_LEN(sa) = KEY_LEN(mask) = 8;
+-	mask.sin_addr.s_addr = htonl(mlen ? ~((1 << (32 - mlen)) - 1) : 0);
+-	sa.sin_addr.s_addr = addr & mask.sin_addr.s_addr;
++
++	switch (type) {
++	case IPFW_TABLE_CIDR:
++		if (plen == sizeof(in_addr_t)) {
++			/* Set 'total' structure length */
++			KEY_LEN(sa) = KEY_LEN_INET;
++			KEY_LEN(mask) = KEY_LEN_INET;
++			mask.sin_addr.s_addr = htonl(mlen ? ~((1 << (32 - mlen)) - 1) : 0);
++			addr = *((in_addr_t *)paddr);
++			sa.sin_addr.s_addr = addr & mask.sin_addr.s_addr;
++			rnh_ptr = &ch->tables[tbl];
++			sa_ptr = (struct sockaddr *)&sa;
++			mask_ptr = (struct sockaddr *)&mask;
++#ifdef INET6
++		} else if (plen == sizeof(struct in6_addr)) {
++			/* IPv6 case */
++			if (mlen > 128)
++				return (EINVAL);
++			struct sockaddr_in6 sa6, mask6;
++			memset(&sa6, 0, sizeof(struct sockaddr_in6));
++			memset(&mask6, 0, sizeof(struct sockaddr_in6));
++			/* Set 'total' structure length */
++			KEY_LEN(sa6) = KEY_LEN_INET6;
++			KEY_LEN(mask6) = KEY_LEN_INET6;
++			ipv6_writemask(&mask6.sin6_addr, mlen);
++			memcpy(&sa6.sin6_addr, paddr, sizeof(struct in6_addr));
++			APPLY_MASK(&sa6.sin6_addr, &mask6.sin6_addr);
++			rnh_ptr = &ch->xtables[tbl];
++			sa_ptr = (struct sockaddr *)&sa6;
++			mask_ptr = (struct sockaddr *)&mask6;
++#endif
++		} else {
++			/* Unknown CIDR type */
++			return (EINVAL);
++		}
++		break;
++
++	case IPFW_TABLE_INTERFACE:
++		/* Check if string is terminated */
++		c = ((char *)paddr)[IF_NAMESIZE - 1];
++		((char *)paddr)[IF_NAMESIZE - 1] = '\0';
++		if (((mlen = strlen((char *)paddr)) == IF_NAMESIZE - 1) && (c != '\0'))
++			return (EINVAL);
++
++		struct xaddr_iface ifname, ifmask;
++		memset(&ifname, 0, sizeof(ifname));
++
++		/* Set 'total' structure length */
++		KEY_LEN(ifname) = mlen;
++		KEY_LEN(ifmask) = mlen;
++		/* Assume direct match */
++		/* FIXME: Add interface pattern matching */
++#if 0
++		memset(ifmask.ifname, 0xFF, IF_NAMESIZE);
++		mask_ptr = (struct sockaddr *)&ifmask;
++#endif
++		mask_ptr = NULL;
++		memcpy(ifname.ifname, paddr, mlen);
++		/* Set pointers */
++		rnh_ptr = &ch->xtables[tbl];
++		sa_ptr = (struct sockaddr *)&ifname;
++
++		break;
++
++	default:
++		return (EINVAL);
++	}
++
+ 	IPFW_WLOCK(ch);
+-	ent = (struct table_entry *)rnh->rnh_deladdr(&sa, &mask, rnh);
+-	if (ent == NULL) {
++	if ((rnh = *rnh_ptr) == NULL) {
+ 		IPFW_WUNLOCK(ch);
+ 		return (ESRCH);
+ 	}
++
++	if (ch->tabletype[tbl] != type) {
++		IPFW_WUNLOCK(ch);
++		return (EINVAL);
++	}
++
++	ent = (struct table_entry *)rnh->rnh_deladdr(sa_ptr, mask_ptr, rnh);
+ 	IPFW_WUNLOCK(ch);
++
++	if (ent == NULL)
++		return (ESRCH);
++
+ 	free(ent, M_IPFW_TBL);
+ 	return (0);
+ }
+@@ -158,15 +399,38 @@ flush_table_entry(struct radix_node *rn, void *arg)
+ int
+ ipfw_flush_table(struct ip_fw_chain *ch, uint16_t tbl)
+ {
+-	struct radix_node_head *rnh;
+-
+-	IPFW_WLOCK_ASSERT(ch);
++	struct radix_node_head *rnh, *xrnh;
+ 
+-	if (tbl >= IPFW_TABLES_MAX)
++	if (tbl >= V_fw_tables_max)
+ 		return (EINVAL);
+-	rnh = ch->tables[tbl];
+-	KASSERT(rnh != NULL, ("NULL IPFW table"));
+-	rnh->rnh_walktree(rnh, flush_table_entry, rnh);
++
++	/*
++	 * We free both (IPv4 and extended) radix trees and
++	 * clear table type here to permit table to be reused
++	 * for different type without module reload
++	 */
++
++	IPFW_WLOCK(ch);
++	/* Set IPv4 table pointer to zero */
++	if ((rnh = ch->tables[tbl]) != NULL)
++		ch->tables[tbl] = NULL;
++	/* Set extended table pointer to zero */
++	if ((xrnh = ch->xtables[tbl]) != NULL)
++		ch->xtables[tbl] = NULL;
++	/* Zero table type */
++	ch->tabletype[tbl] = 0;
++	IPFW_WUNLOCK(ch);
++
++	if (rnh != NULL) {
++		rnh->rnh_walktree(rnh, flush_table_entry, rnh);
++		rn_detachhead((void **)&rnh);
++	}
++
++	if (xrnh != NULL) {
++		xrnh->rnh_walktree(xrnh, flush_table_entry, xrnh);
++		rn_detachhead((void **)&xrnh);
++	}
++
+ 	return (0);
+ }
+ 
+@@ -174,31 +438,86 @@ void
+ ipfw_destroy_tables(struct ip_fw_chain *ch)
+ {
+ 	uint16_t tbl;
+-	struct radix_node_head *rnh;
+ 
+-	IPFW_WLOCK_ASSERT(ch);
+-
+-	for (tbl = 0; tbl < IPFW_TABLES_MAX; tbl++) {
++	/* Flush all tables */
++	for (tbl = 0; tbl < V_fw_tables_max; tbl++)
+ 		ipfw_flush_table(ch, tbl);
+-		rnh = ch->tables[tbl];
+-		rn_detachhead((void **)&rnh);
+-	}
++
++	/* Free pointers itself */
++	free(ch->tables, M_IPFW);
++	free(ch->xtables, M_IPFW);
++	free(ch->tabletype, M_IPFW);
+ }
+ 
+ int
+ ipfw_init_tables(struct ip_fw_chain *ch)
+-{ 
+-	int i;
+-	uint16_t j;
++{
++	/* Allocate pointers */
++	ch->tables = malloc(V_fw_tables_max * sizeof(void *), M_IPFW, M_WAITOK | M_ZERO);
++	ch->xtables = malloc(V_fw_tables_max * sizeof(void *), M_IPFW, M_WAITOK | M_ZERO);
++	ch->tabletype = malloc(V_fw_tables_max * sizeof(uint8_t), M_IPFW, M_WAITOK | M_ZERO);
++	return (0);
++}
++
++int
++ipfw_resize_tables(struct ip_fw_chain *ch, unsigned int ntables)
++{
++	struct radix_node_head **tables, **xtables, *rnh;
++	struct radix_node_head **tables_old, **xtables_old;
++	uint8_t *tabletype, *tabletype_old;
++	unsigned int ntables_old, tbl;
++
++	/* Check new value for validity */
++	if (ntables > IPFW_TABLES_MAX)
++		ntables = IPFW_TABLES_MAX;
++
++	/* Allocate new pointers */
++	tables = malloc(ntables * sizeof(void *), M_IPFW, M_WAITOK | M_ZERO);
++	xtables = malloc(ntables * sizeof(void *), M_IPFW, M_WAITOK | M_ZERO);
++	tabletype = malloc(ntables * sizeof(uint8_t), M_IPFW, M_WAITOK | M_ZERO);
++
++	IPFW_WLOCK(ch);
++
++	tbl = (ntables >= V_fw_tables_max) ? V_fw_tables_max : ntables;
++
++	/* Copy old table pointers */
++	memcpy(tables, ch->tables, sizeof(void *) * tbl);
++	memcpy(xtables, ch->xtables, sizeof(void *) * tbl);
++	memcpy(tabletype, ch->tabletype, sizeof(uint8_t) * tbl);
++
++	/* Change pointers and number of tables */
++	tables_old = ch->tables;
++	xtables_old = ch->xtables;
++	tabletype_old = ch->tabletype;
++	ch->tables = tables;
++	ch->xtables = xtables;
++	ch->tabletype = tabletype;
++
++	ntables_old = V_fw_tables_max;
++	V_fw_tables_max = ntables;
++
++	IPFW_WUNLOCK(ch);
+ 
+-	for (i = 0; i < IPFW_TABLES_MAX; i++) {
+-		if (!rn_inithead((void **)&ch->tables[i], KEY_OFS)) {
+-			for (j = 0; j < i; j++) {
+-				(void) ipfw_flush_table(ch, j);
++	/* Check if we need to destroy radix trees */
++	if (ntables < ntables_old) {
++		for (tbl = ntables; tbl < ntables_old; tbl++) {
++			if ((rnh = tables_old[tbl]) != NULL) {
++				rnh->rnh_walktree(rnh, flush_table_entry, rnh);
++				rn_detachhead((void **)&rnh);
++			}
++
++			if ((rnh = xtables_old[tbl]) != NULL) {
++				rnh->rnh_walktree(rnh, flush_table_entry, rnh);
++				rn_detachhead((void **)&rnh);
+ 			}
+-			return (ENOMEM);
+ 		}
+ 	}
++
++	/* Free old pointers */
++	free(tables_old, M_IPFW);
++	free(xtables_old, M_IPFW);
++	free(tabletype_old, M_IPFW);
++
+ 	return (0);
+ }
+ 
+@@ -210,10 +529,11 @@ ipfw_lookup_table(struct ip_fw_chain *ch, uint16_t tbl, in_addr_t addr,
+ 	struct table_entry *ent;
+ 	struct sockaddr_in sa;
+ 
+-	if (tbl >= IPFW_TABLES_MAX)
++	if (tbl >= V_fw_tables_max)
++		return (0);
++	if ((rnh = ch->tables[tbl]) == NULL)
+ 		return (0);
+-	rnh = ch->tables[tbl];
+-	KEY_LEN(sa) = 8;
++	KEY_LEN(sa) = KEY_LEN_INET;
+ 	sa.sin_addr.s_addr = addr;
+ 	ent = (struct table_entry *)(rnh->rnh_lookup(&sa, NULL, rnh));
+ 	if (ent != NULL) {
+@@ -223,6 +543,45 @@ ipfw_lookup_table(struct ip_fw_chain *ch, uint16_t tbl, in_addr_t addr,
+ 	return (0);
+ }
+ 
++int
++ipfw_lookup_table_extended(struct ip_fw_chain *ch, uint16_t tbl, void *paddr,
++    uint32_t *val, int type)
++{
++	struct radix_node_head *rnh;
++	struct table_xentry *xent;
++	struct sockaddr_in6 sa6;
++	struct xaddr_iface iface;
++
++	if (tbl >= V_fw_tables_max)
++		return (0);
++	if ((rnh = ch->xtables[tbl]) == NULL)
++		return (0);
++
++	switch (type) {
++	case IPFW_TABLE_CIDR:
++		KEY_LEN(sa6) = KEY_LEN_INET6;
++		memcpy(&sa6.sin6_addr, paddr, sizeof(struct in6_addr));
++		xent = (struct table_xentry *)(rnh->rnh_lookup(&sa6, NULL, rnh));
++		break;
++
++	case IPFW_TABLE_INTERFACE:
++		KEY_LEN(iface) = strlcpy(iface.ifname, (char *)paddr, IF_NAMESIZE);
++		/* Assume direct match */
++		/* FIXME: Add interface pattern matching */
++		xent = (struct table_xentry *)(rnh->rnh_lookup(&iface, NULL, rnh));
++		break;
++
++	default:
++		return (0);
++	}
++
++	if (xent != NULL) {
++		*val = xent->value;
++		return (1);
++	}
++	return (0);
++}
++
+ static int
+ count_table_entry(struct radix_node *rn, void *arg)
+ {
+@@ -237,10 +596,11 @@ ipfw_count_table(struct ip_fw_chain *ch, uint32_t tbl, uint32_t *cnt)
+ {
+ 	struct radix_node_head *rnh;
+ 
+-	if (tbl >= IPFW_TABLES_MAX)
++	if (tbl >= V_fw_tables_max)
+ 		return (EINVAL);
+-	rnh = ch->tables[tbl];
+ 	*cnt = 0;
++	if ((rnh = ch->tables[tbl]) == NULL)
++		return (0);
+ 	rnh->rnh_walktree(rnh, count_table_entry, cnt);
+ 	return (0);
+ }
+@@ -271,11 +631,124 @@ ipfw_dump_table(struct ip_fw_chain *ch, ipfw_table *tbl)
+ {
+ 	struct radix_node_head *rnh;
+ 
+-	if (tbl->tbl >= IPFW_TABLES_MAX)
++	if (tbl->tbl >= V_fw_tables_max)
+ 		return (EINVAL);
+-	rnh = ch->tables[tbl->tbl];
+ 	tbl->cnt = 0;
++	if ((rnh = ch->tables[tbl->tbl]) == NULL)
++		return (0);
+ 	rnh->rnh_walktree(rnh, dump_table_entry, tbl);
+ 	return (0);
+ }
++
++static int
++count_table_xentry(struct radix_node *rn, void *arg)
++{
++	uint32_t * const cnt = arg;
++
++	(*cnt) += sizeof(ipfw_table_xentry);
++	return (0);
++}
++
++int
++ipfw_count_xtable(struct ip_fw_chain *ch, uint32_t tbl, uint32_t *cnt)
++{
++	struct radix_node_head *rnh;
++
++	if (tbl >= V_fw_tables_max)
++		return (EINVAL);
++	*cnt = 0;
++	if ((rnh = ch->tables[tbl]) != NULL)
++		rnh->rnh_walktree(rnh, count_table_xentry, cnt);
++	if ((rnh = ch->xtables[tbl]) != NULL)
++		rnh->rnh_walktree(rnh, count_table_xentry, cnt);
++	/* Return zero if table is empty */
++	if (*cnt > 0)
++		(*cnt) += sizeof(ipfw_xtable);
++	return (0);
++}
++
++
++static int
++dump_table_xentry_base(struct radix_node *rn, void *arg)
++{
++	struct table_entry * const n = (struct table_entry *)rn;
++	ipfw_xtable * const tbl = arg;
++	ipfw_table_xentry *xent;
++
++	/* Out of memory, returning */
++	if (tbl->cnt == tbl->size)
++		return (1);
++	xent = &tbl->xent[tbl->cnt];
++	xent->len = sizeof(ipfw_table_xentry);
++	xent->tbl = tbl->tbl;
++	if (in_nullhost(n->mask.sin_addr))
++		xent->masklen = 0;
++	else
++		xent->masklen = 33 - ffs(ntohl(n->mask.sin_addr.s_addr));
++	/* Save IPv4 address as deprecated IPv6 compatible */
++	xent->k.addr6.s6_addr32[3] = n->addr.sin_addr.s_addr;
++	xent->value = n->value;
++	tbl->cnt++;
++	return (0);
++}
++
++static int
++dump_table_xentry_extended(struct radix_node *rn, void *arg)
++{
++	struct table_xentry * const n = (struct table_xentry *)rn;
++	ipfw_xtable * const tbl = arg;
++	ipfw_table_xentry *xent;
++#ifdef INET6
++	int i;
++	uint32_t *v;
++#endif
++	/* Out of memory, returning */
++	if (tbl->cnt == tbl->size)
++		return (1);
++	xent = &tbl->xent[tbl->cnt];
++	xent->len = sizeof(ipfw_table_xentry);
++	xent->tbl = tbl->tbl;
++
++	switch (tbl->type) {
++#ifdef INET6
++	case IPFW_TABLE_CIDR:
++		/* Count IPv6 mask */
++		v = (uint32_t *)&n->m.mask6.sin6_addr;
++		for (i = 0; i < sizeof(struct in6_addr) / 4; i++, v++)
++			xent->masklen += bitcount32(*v);
++		memcpy(&xent->k, &n->a.addr6.sin6_addr, sizeof(struct in6_addr));
++		break;
++#endif
++	case IPFW_TABLE_INTERFACE:
++		/* Assume exact mask */
++		xent->masklen = 8 * IF_NAMESIZE;
++		memcpy(&xent->k, &n->a.iface.ifname, IF_NAMESIZE);
++		break;
++	
++	default:
++		/* unknown, skip entry */
++		return (0);
++	}
++
++	xent->value = n->value;
++	tbl->cnt++;
++	return (0);
++}
++
++int
++ipfw_dump_xtable(struct ip_fw_chain *ch, ipfw_xtable *tbl)
++{
++	struct radix_node_head *rnh;
++
++	if (tbl->tbl >= V_fw_tables_max)
++		return (EINVAL);
++	tbl->cnt = 0;
++	tbl->type = ch->tabletype[tbl->tbl];
++	if ((rnh = ch->tables[tbl->tbl]) != NULL)
++		rnh->rnh_walktree(rnh, dump_table_xentry_base, tbl);
++	if ((rnh = ch->xtables[tbl->tbl]) != NULL)
++		rnh->rnh_walktree(rnh, dump_table_xentry_extended, tbl);
++	return (0);
++}
++
+ /* end of file */

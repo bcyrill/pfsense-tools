@@ -68,6 +68,10 @@ IS ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #define IS_EXT_MODULE
 
+/* packing rule for routing socket */
+#define ROUNDUP(a) \
+	((a) > 0 ? (1 + (((a) - 1) | (sizeof(long) - 1))) : sizeof(long))
+
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
@@ -91,6 +95,8 @@ IS ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <netinet/in_var.h>
 #include <net/pfvar.h>
 
+#include <stddef.h>	/* offsetof */
+
 #include <netinet/ip_fw.h>
 #include <sys/ioctl.h>
 #include <sys/sysctl.h>
@@ -101,8 +107,6 @@ IS ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <netgraph/ng_message.h>
 #include <netgraph/ng_ether.h>
-
-#include <netinet/ip_fw.h>
 
 #include <vm/vm_param.h>
 
@@ -306,9 +310,9 @@ PHP_MINIT_FUNCTION(pfSense_socket)
 	REGISTER_LONG_CONSTANT("IFBIF_PRIVATE", IFBIF_PRIVATE, CONST_PERSISTENT | CONST_CS);
 
 #ifdef IPFW_FUNCTIONS
-	REGISTER_LONG_CONSTANT("IP_FW_TABLE_ADD", IP_FW_TABLE_ADD, CONST_PERSISTENT | CONST_CS);
-	REGISTER_LONG_CONSTANT("IP_FW_TABLE_DEL", IP_FW_TABLE_DEL, CONST_PERSISTENT | CONST_CS);
-	REGISTER_LONG_CONSTANT("IP_FW_TABLE_ZERO_ENTRY_STATS", IP_FW_TABLE_ZERO_ENTRY_STATS, CONST_PERSISTENT | CONST_CS);
+	REGISTER_LONG_CONSTANT("IP_FW_TABLE_ADD", IP_FW_TABLE_XADD, CONST_PERSISTENT | CONST_CS);
+	REGISTER_LONG_CONSTANT("IP_FW_TABLE_DEL", IP_FW_TABLE_XDEL, CONST_PERSISTENT | CONST_CS);
+	REGISTER_LONG_CONSTANT("IP_FW_TABLE_ZERO_ENTRY_STATS", IP_FW_TABLE_XZERO_ENTRY_STATS, CONST_PERSISTENT | CONST_CS);
 #endif
 
 	return SUCCESS;
@@ -705,12 +709,14 @@ PHP_FUNCTION(pfSense_pipe_action)
 
 PHP_FUNCTION(pfSense_ipfw_Tableaction)
 {
-	ipfw_table_entry ent;
+	ipfw_table_xentry xent;
 	socklen_t size;
 	int mask = 0, table = 0, pipe = 0;
 	char *ip, *zone, *mac = NULL, *p;
-	int ip_len, zone_len, mac_len = 0, action = IP_FW_TABLE_ADD;
+	int ip_len, zone_len, mac_len = 0, action = IP_FW_TABLE_XADD;
 	int err;
+	size_t addrlen;
+	ip_fw3_opheader *op3;
 
 	if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "slls|lsl", &zone, &zone_len, &action, &table, &ip, &ip_len, &mask, &mac, &mac_len, &pipe) == FAILURE) {
 		RETURN_FALSE;
@@ -718,31 +724,40 @@ PHP_FUNCTION(pfSense_ipfw_Tableaction)
 
 	/* XXX: Use context data! */
 
-	memset(&ent, 0, sizeof(ent));
-	if (action != IP_FW_TABLE_DEL && action != IP_FW_TABLE_ADD && action != IP_FW_TABLE_ZERO_ENTRY_STATS)
+	memset(&xent, 0, sizeof(xent));
+	if (action != IP_FW_TABLE_XDEL && action != IP_FW_TABLE_XADD && action != IP_FW_TABLE_XZERO_ENTRY_STATS)
 		RETURN_FALSE;
-
-	if (strchr(ip, ':')) {
-		if (!inet_pton(AF_INET6, ip, &ent.addr))
-			RETURN_FALSE;
-	} else if (!inet_pton(AF_INET, ip, &ent.addr)) {
+		
+	if (inet_pton(AF_INET, ip, &xent.k.addr6) == 1) {
+		xent.masklen = (mask) ? mask : 32;
+		addrlen = sizeof(struct in_addr);
+	} else if (inet_pton(AF_INET6, ip, &xent.k.addr6) == 1) {
+		xent.masklen = (mask) ? mask : 128;
+		addrlen = sizeof(struct in6_addr);
+	} else {
 		RETURN_FALSE;
 	}
-
-	if (mask)
-		ent.masklen = mask;
-	else
-		ent.masklen = 32;
+	
 	if (pipe)
-		ent.value = pipe;
-
+		xent.value = pipe;
+	
 	if (mac_len > 0) {
-		if (ether_aton_r(mac, (struct ether_addr *)&ent.mac_addr) == NULL)
+		if (ether_aton_r(mac, (struct ether_addr *)&xent.mac_addr) == NULL)
 			RETURN_FALSE;
 	}
-	size = sizeof(ent);
-	ent.tbl = table;
-	err = setsockopt(PFSENSE_G(ipfw), IPPROTO_IP, action, &ent, size);
+	
+	xent.tbl = table;
+	xent.type = IPFW_TABLE_CIDR;
+	xent.len = offsetof(ipfw_table_xentry, k) + addrlen;
+	
+	size = sizeof(ip_fw3_opheader) + sizeof(ipfw_table_xentry);
+	op3 = alloca(size);
+	/* Zero reserved fields */
+	memset(op3, 0, sizeof(ip_fw3_opheader));
+	memcpy(op3 + 1, &xent, sizeof(ipfw_table_xentry));
+	op3->opcode = action;
+	
+	err = setsockopt(PFSENSE_G(ipfw), IPPROTO_IP, IP_FW3, op3, size);
 	if (err < 0 && err != EEXIST)
 		RETURN_FALSE;
 
@@ -751,11 +766,14 @@ PHP_FUNCTION(pfSense_ipfw_Tableaction)
 
 PHP_FUNCTION(pfSense_ipfw_getTablestats)
 {
-	ipfw_table_entry ent;
+	ipfw_table_xentry xent;
+	ipfw_table_xentry *tmp;
 	socklen_t size;
 	int mask = 0, table;
 	char *ip, *name;
 	int ip_len, name_len;
+	uint32_t addrlen;
+	ip_fw3_opheader *op3;
 
 	if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "sls|l", &name, &name_len, &table, &ip, &ip_len, &mask) == FAILURE) {
 		RETURN_FALSE;
@@ -763,27 +781,37 @@ PHP_FUNCTION(pfSense_ipfw_getTablestats)
 
 	/* XXX: Use context data! */
 
-	if (strchr(ip, ':')) {
-		if (!inet_pton(AF_INET6, ip, &ent.addr))
-			RETURN_FALSE;
-	} else if (!inet_pton(AF_INET, ip, &ent.addr)) {
+	memset(&xent, 0, sizeof(xent));
+	if (inet_pton(AF_INET, ip, &xent.k.addr6) == 1) {
+		xent.masklen = (mask) ? mask : 32;
+		addrlen = sizeof(struct in_addr);
+	} else if (inet_pton(AF_INET6, ip, &xent.k.addr6) == 1) {
+		xent.masklen = (mask) ? mask : 128;
+		addrlen = sizeof(struct in6_addr);
+	} else {
 		RETURN_FALSE;
 	}
 
-	if (mask)
-		ent.masklen = mask;
-	else
-		ent.masklen = 32;
-	size = sizeof(ent);
-	ent.tbl = table;
-	if (getsockopt(PFSENSE_G(ipfw), IPPROTO_IP, IP_FW_TABLE_GET_ENTRY, &ent, &size) < 0)
+	xent.tbl = table;
+	xent.type = IPFW_TABLE_CIDR;
+	xent.len = offsetof(ipfw_table_xentry, k) + addrlen;
+	
+	size = sizeof(ip_fw3_opheader) + sizeof(ipfw_table_xentry);
+	op3 = alloca(size);
+	/* Zero reserved fields */
+	memset(op3, 0, sizeof(ip_fw3_opheader));
+	tmp = (ipfw_table_xentry *)(op3 + 1);
+	memcpy(tmp, &xent, sizeof(ipfw_table_xentry));
+	op3->opcode = IP_FW_TABLE_XGET_ENTRY;
+
+	if (getsockopt(PFSENSE_G(ipfw), IPPROTO_IP, IP_FW3, op3, &size) < 0)
 		RETURN_FALSE;
 
 	array_init(return_value);
-	add_assoc_long(return_value, "packets", pfSense_align_uint64(&ent.packets));
-	add_assoc_long(return_value, "bytes", pfSense_align_uint64(&ent.bytes));
-	add_assoc_long(return_value, "timestamp", ent.timestamp);
-	add_assoc_long(return_value, "dnpipe", ent.value);
+	add_assoc_long(return_value, "packets", pfSense_align_uint64(&tmp->packets));
+	add_assoc_long(return_value, "bytes", pfSense_align_uint64(&tmp->bytes));
+	add_assoc_long(return_value, "timestamp", tmp->timestamp);
+	add_assoc_long(return_value, "dnpipe", tmp->value);
 }
 #endif
 
@@ -974,26 +1002,31 @@ PHP_FUNCTION(pfSense_ip_to_mac)
 	int mib[6];
 	size_t needed;
 	char *lim, *buf, *next;
+	struct addrinfo hints, *res;
 	struct rt_msghdr *rtm;
-	struct sockaddr_inarp *sin2, addr;
+	struct sockaddr_storage *sin2, addr;
 	struct sockaddr_dl *sdl;
 	char ifname[IF_NAMESIZE];
-	int st, found_entry = 0;
+	int ret_ga, st, found_entry = 0;
 	char outputbuf[128];
 
-        if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s|s", &ip, &ip_len, &rifname, &ifname_len) == FAILURE)
-                RETURN_NULL();
-
-	bzero(&addr, sizeof(addr));
-	if (!inet_pton(AF_INET, ip, &addr.sin_addr.s_addr))
+	if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s|s", &ip, &ip_len, &rifname, &ifname_len) == FAILURE)
 		RETURN_NULL();
-	addr.sin_len = sizeof(addr);
-	addr.sin_family = AF_INET;
+
+	bzero(&hints, sizeof(hints));
+	hints.ai_flags |= AI_NUMERICHOST;
+
+	if ((ret_ga = getaddrinfo(ip, NULL, &hints, &res))) {
+		php_printf("getaddrinfo: %s", gai_strerror(ret_ga));
+		RETURN_NULL();
+	}
+	memcpy(&addr, res->ai_addr, res->ai_addrlen);
+	freeaddrinfo(res);
 
 	mib[0] = CTL_NET;
 	mib[1] = PF_ROUTE;
 	mib[2] = 0;
-	mib[3] = AF_INET;
+	mib[3] = addr.ss_family;
 	mib[4] = NET_RT_FLAGS;
 #ifdef RTF_LLINFO
 	mib[5] = RTF_LLINFO;
@@ -1019,22 +1052,35 @@ PHP_FUNCTION(pfSense_ip_to_mac)
 			break;
 		needed += needed / 8;
 	}
-	if (st == -1)
-		php_printf("actual retrieval of routing table");
+	if (st == -1) /* error during sysctl call */
+		RETURN_NULL();
 	lim = buf + needed;
 	for (next = buf; next < lim; next += rtm->rtm_msglen) {
 		rtm = (struct rt_msghdr *)next;
-		sin2 = (struct sockaddr_inarp *)(rtm + 1);
-		sdl = (struct sockaddr_dl *)((char *)sin2 + SA_SIZE(sin2));
+		sin2 = (struct sockaddr_storage *)(rtm + 1);
+		sdl = (struct sockaddr_dl *)((char *)sin2 + ROUNDUP(sin2->ss_len));
+		if (sdl->sdl_family != AF_LINK)
+			continue;
+		if (!(rtm->rtm_flags & RTF_HOST))
+			continue;
 		if (rifname && if_indextoname(sdl->sdl_index, ifname) &&
 		    strcmp(ifname, rifname))
 			continue;
-		if (addr.sin_addr.s_addr == sin2->sin_addr.s_addr) {
-			found_entry = 1;
+		switch (sin2->ss_family) {
+		case AF_INET:
+			if (((struct sockaddr_inarp *)&addr)->sin_addr.s_addr == ((struct sockaddr_inarp *)sin2)->sin_addr.s_addr)
+				found_entry = 1;
+			break;
+		case AF_INET6:
+			if (IN6_ARE_ADDR_EQUAL(&(((struct sockaddr_in6 *)&addr)->sin6_addr), &(((struct sockaddr_in6 *)sin2)->sin6_addr)))
+				found_entry = 1;
 			break;
 		}
+		if (found_entry == 1)
+			break;
 	}
-	free(buf);
+	if (buf != NULL)
+		free(buf);
 
 	if (found_entry == 0)
 		RETURN_NULL();

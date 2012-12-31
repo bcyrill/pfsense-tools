@@ -1,0 +1,888 @@
+diff --git a/sbin/ipfw/ipfw2.c b/sbin/ipfw/ipfw2.c
+index de327df..5274daa 100644
+--- a/sbin/ipfw/ipfw2.c
++++ b/sbin/ipfw/ipfw2.c
+@@ -1143,6 +1143,18 @@ show_ipfw(struct ip_fw *rule, int pcwidth, int bcwidth)
+ 		    }
+ 			break;
+ 
++		case O_FORWARD_IP6:
++		    {
++			char buf[4 + INET6_ADDRSTRLEN + 1];
++			ipfw_insn_sa6 *s = (ipfw_insn_sa6 *)cmd;
++
++			printf("fwd %s", inet_ntop(AF_INET6, &s->sa.sin6_addr,
++			    buf, sizeof(buf)));
++			if (s->sa.sin6_port)
++				printf(",%d", s->sa.sin6_port);
++		    }
++			break;
++
+ 		case O_LOG: /* O_LOG is printed last */
+ 			logptr = (ipfw_insn_log *)cmd;
+ 			break;
+@@ -2848,40 +2860,96 @@ chkarg:
+ 		break;
+ 
+ 	case TOK_FORWARD: {
+-		ipfw_insn_sa *p = (ipfw_insn_sa *)action;
++		/*
++		 * Locate the address-port separator (':' or ',').
++		 * Could be one of the following:
++		 *	hostname:port
++		 *	IPv4 a.b.c.d,port
++		 *	IPv4 a.b.c.d:port
++		 *	IPv6 w:x:y::z,port
++		 * The ':' can only be used with hostname and IPv4 address.
++		 * XXX-BZ Should we also support [w:x:y::z]:port?
++		 */
++		struct sockaddr_storage result;
++		struct addrinfo *res;
+ 		char *s, *end;
++		int family;
++		u_short port_number;
+ 
+ 		NEED1("missing forward address[:port]");
+ 
+-		action->opcode = O_FORWARD_IP;
+-		action->len = F_INSN_SIZE(ipfw_insn_sa);
+-
+-		/*
+-		 * In the kernel we assume AF_INET and use only
+-		 * sin_port and sin_addr. Remember to set sin_len as
+-		 * the routing code seems to use it too.
+-		 */
+-		p->sa.sin_family = AF_INET;
+-		p->sa.sin_len = sizeof(struct sockaddr_in);
+-		p->sa.sin_port = 0;
+ 		/*
+ 		 * locate the address-port separator (':' or ',')
+ 		 */
+-		s = strchr(*av, ':');
+-		if (s == NULL)
+-			s = strchr(*av, ',');
++		s = strchr(*av, ',');
++		if (s == NULL) {
++			/* Distinguish between IPv4:port and IPv6 cases. */
++			s = strchr(*av, ':');
++			if (s && strchr(s+1, ':'))
++				s = NULL; /* no port */
++		}
++
++		port_number = 0;
+ 		if (s != NULL) {
++			/* Terminate host portion and set s to start of port. */
+ 			*(s++) = '\0';
+ 			i = strtoport(s, &end, 0 /* base */, 0 /* proto */);
+ 			if (s == end)
+ 				errx(EX_DATAERR,
+ 				    "illegal forwarding port ``%s''", s);
+-			p->sa.sin_port = (u_short)i;
++			port_number = (u_short)i;
++		}
++
++		if (_substrcmp(*av, "tablearg") == 0) {
++			family = PF_INET;
++			((struct sockaddr_in*)&result)->sin_addr.s_addr =
++			    INADDR_ANY;
++		} else {
++			/* 
++			 * Resolve the host name or address to a family and a
++			 * network representation of the addres.
++			 */
++			if (getaddrinfo(*av, NULL, NULL, &res))
++				errx(EX_DATAERR, NULL);
++			/* Just use the first host in the answer. */
++			family = res->ai_family;
++			memcpy(&result, res->ai_addr, res->ai_addrlen);
++			freeaddrinfo(res);
++		}
++
++		if (family == PF_INET) {
++			ipfw_insn_sa *p = (ipfw_insn_sa *)action;
++
++			action->opcode = O_FORWARD_IP;
++			action->len = F_INSN_SIZE(ipfw_insn_sa);
++
++			/*
++			 * In the kernel we assume AF_INET and use only
++			 * sin_port and sin_addr. Remember to set sin_len as
++			 * the routing code seems to use it too.
++			 */
++			p->sa.sin_len = sizeof(struct sockaddr_in);
++			p->sa.sin_family = AF_INET;
++			p->sa.sin_port = port_number;
++			p->sa.sin_addr.s_addr =
++			     ((struct sockaddr_in *)&result)->sin_addr.s_addr;
++		} else if (family == PF_INET6) {
++			ipfw_insn_sa6 *p = (ipfw_insn_sa6 *)action;
++
++			action->opcode = O_FORWARD_IP6;
++			action->len = F_INSN_SIZE(ipfw_insn_sa6);
++
++			p->sa.sin6_len = sizeof(struct sockaddr_in6);
++			p->sa.sin6_family = AF_INET6;
++			p->sa.sin6_port = port_number;
++			p->sa.sin6_flowinfo = 0;
++			p->sa.sin6_scope_id = 0;
++			/* No table support for v6 yet. */
++			bcopy(&((struct sockaddr_in6*)&result)->sin6_addr,
++			    &p->sa.sin6_addr, sizeof(p->sa.sin6_addr));
++		} else {
++			errx(EX_DATAERR, "Invalid address family in forward action");
+ 		}
+-		if (_substrcmp(*av, "tablearg") == 0)
+-			p->sa.sin_addr.s_addr = INADDR_ANY;
+-		else
+-			lookup_host(*av, &(p->sa.sin_addr));
+ 		av++;
+ 		break;
+ 	    }
+diff --git a/sys/netinet/ip_fw.h b/sys/netinet/ip_fw.h
+index 92e9579..463ab56 100644
+--- a/sys/netinet/ip_fw.h
++++ b/sys/netinet/ip_fw.h
+@@ -216,6 +216,8 @@ enum ipfw_opcodes {		/* arguments (4 byte each)	*/
+ 
+ 	O_CALLRETURN,		/* arg1=called rule number */
+ 
++	O_FORWARD_IP6,		/* fwd sockaddr_in6 */
++
+ 	O_LAST_OPCODE		/* not an opcode!		*/
+ };
+ 
+@@ -311,6 +313,14 @@ typedef struct  _ipfw_insn_sa {
+ } ipfw_insn_sa;
+ 
+ /*
++ * This is used to forward to a given address (ipv6).
++ */
++typedef struct _ipfw_insn_sa6 {
++	ipfw_insn o;
++	struct sockaddr_in6 sa;
++} ipfw_insn_sa6;
++
++/*
+  * This is used for MAC addr-mask pairs.
+  */
+ typedef struct	_ipfw_insn_mac {
+diff --git a/sys/netinet/ipfw/ip_fw2.c b/sys/netinet/ipfw/ip_fw2.c
+index 7a35495..7ba9a77 100644
+--- a/sys/netinet/ipfw/ip_fw2.c
++++ b/sys/netinet/ipfw/ip_fw2.c
+@@ -770,6 +770,7 @@ set_match(struct ip_fw_args *args, int slot,
+  *
+  *	args->rule	Pointer to the last matching rule (in/out)
+  *	args->next_hop	Socket we are forwarding to (out).
++ *	args->next_hop6	IPv6 next hop we are forwarding to (out).
+  *	args->f_id	Addresses grabbed from the packet (out)
+  * 	args->rule.info	a cookie depending on rule action
+  *
+@@ -2304,6 +2305,43 @@ do {								\
+ 				done = 1;       /* exit outer loop */
+ 				break;
+ 
++#ifdef INET6
++			case O_FORWARD_IP6:
++				if (!args->eh) {
++					if (q == NULL || q->rule != f ||
++						dyn_dir == MATCH_FORWARD) {
++						struct sockaddr_in6 *sin6;
++
++						sin6 = &(((ipfw_insn_sa6 *)cmd)->sa);
++						args->next_hop6 = sin6;
++					}
++				}  else if (args->eh) {
++					struct m_tag *fwd_tag;
++					struct sockaddr_in6 *sin6;
++
++					/*
++					 * IPv6 header has no checksum
++					 */
++
++					sin6 = &(((ipfw_insn_sa6 *)cmd)->sa);
++					fwd_tag = m_tag_get(PACKET_TAG_IPFORWARD, sizeof(struct sockaddr_in6), M_NOWAIT);
++					if (fwd_tag == NULL)
++						retval = IP_FW_DENY;
++					else {
++						bcopy(sin6, (fwd_tag+1), sizeof(struct sockaddr_in6));
++						m_tag_prepend(m, fwd_tag);
++ 
++						if (in6_localip(&sin6->sin6_addr)) {
++  							m->m_flags |= M_FASTFWD_OURS;
++						}
++					}
++				}
++				retval = IP_FW_PASS;
++				l = 0;		/* exit inner loop */
++				done = 1;	/* exit outer loop */
++				break;
++#endif
++
+ 			case O_NETGRAPH:
+ 			case O_NGTEE:
+ 				set_match(args, f_pos, chain);
+diff --git a/sys/netinet/ipfw/ip_fw_log.c b/sys/netinet/ipfw/ip_fw_log.c
+index e5dbf69..b9ed6b3 100644
+--- a/sys/netinet/ipfw/ip_fw_log.c
++++ b/sys/netinet/ipfw/ip_fw_log.c
+@@ -162,7 +162,7 @@ ipfw_log(struct ip_fw *f, u_int hlen, struct ip_fw_args *args,
+ {
+ 	char *action;
+ 	int limit_reached = 0;
+-	char action2[40], proto[128], fragment[32];
++	char action2[92], proto[128], fragment[32];
+ 
+ 	if (V_fw_verbose == 0) {
+ #ifndef WITHOUT_BPF
+@@ -285,6 +285,21 @@ ipfw_log(struct ip_fw *f, u_int hlen, struct ip_fw_args *args,
+ 				    sa->sa.sin_port);
+ 			}
+ 			break;
++#ifdef INET6
++		case O_FORWARD_IP6: {
++			char buf[INET6_ADDRSTRLEN];
++			ipfw_insn_sa6 *sa = (ipfw_insn_sa6 *)cmd;
++			int len;
++
++			len = snprintf(SNPARGS(action2, 0), "Forward to [%s]",
++			    ip6_sprintf(buf, &sa->sa.sin6_addr));
++
++			if (sa->sa.sin6_port)
++				snprintf(SNPARGS(action2, len), ":%u",
++				    sa->sa.sin6_port);
++			}
++			break;
++#endif
+ 		case O_NETGRAPH:
+ 			snprintf(SNPARGS(action2, 0), "Netgraph %d",
+ 				cmd->arg1);
+diff --git a/sys/netinet/ipfw/ip_fw_pfil.c b/sys/netinet/ipfw/ip_fw_pfil.c
+index 14dc018..4ccefd5 100644
+--- a/sys/netinet/ipfw/ip_fw_pfil.c
++++ b/sys/netinet/ipfw/ip_fw_pfil.c
+@@ -146,14 +146,26 @@ again:
+ 	switch (ipfw) {
+ 	case IP_FW_PASS:
+ 		/* next_hop may be set by ipfw_chk */
+-                if (args.next_hop == NULL)
+-                        break; /* pass */
++		if (args.next_hop == NULL && args.next_hop6 == NULL)
++			break; /* pass */
+ #if !defined(IPFIREWALL_FORWARD) || (!defined(INET6) && !defined(INET))
+ 		ret = EACCES;
+ #else
+ 	    {
+ 		struct m_tag *fwd_tag;
++		size_t len;
+ 
++		KASSERT(args.next_hop == NULL || args.next_hop6 == NULL,
++		    ("%s: both next_hop=%p and next_hop6=%p not NULL", __func__,
++		     args.next_hop, args.next_hop6));
++#ifdef INET6
++		if (args.next_hop6 != NULL)
++			len = sizeof(struct sockaddr_in6);
++#endif
++#ifdef INET
++		if (args.next_hop != NULL)
++			len = sizeof(struct sockaddr_in);
++#endif
+ 		/* Incoming packets should not be tagged so we do not
+ 		 * m_tag_find. Outgoing packets may be tagged, so we
+ 		 * reuse the tag if present.
+@@ -163,19 +175,31 @@ again:
+ 		if (fwd_tag != NULL) {
+ 			m_tag_unlink(*m0, fwd_tag);
+ 		} else {
+-			fwd_tag = m_tag_get(PACKET_TAG_IPFORWARD,
+-				sizeof(struct sockaddr_in), M_NOWAIT);
++			fwd_tag = m_tag_get(PACKET_TAG_IPFORWARD, len,
++			    M_NOWAIT);
+ 			if (fwd_tag == NULL) {
+ 				ret = EACCES;
+ 				break; /* i.e. drop */
+ 			}
+ 		}
+-		bcopy(args.next_hop, (fwd_tag+1), sizeof(struct sockaddr_in));
++#ifdef INET6
++		if (args.next_hop6 != NULL) {
++			bcopy(args.next_hop6, (fwd_tag+1), len);
++			if (in6_localip(&args.next_hop6->sin6_addr))
++				(*m0)->m_flags |= M_FASTFWD_OURS;
++		}
++#endif
++#ifdef INET
++		if (args.next_hop != NULL) {
++			bcopy(args.next_hop, (fwd_tag+1), len);
++			if (in_localip(args.next_hop->sin_addr))
++				(*m0)->m_flags |= M_FASTFWD_OURS;
++		}
++#endif
+ 		m_tag_prepend(*m0, fwd_tag);
++		
++		}
+ 
+-		if (in_localip(args.next_hop->sin_addr))
+-			(*m0)->m_flags |= M_FASTFWD_OURS;
+-	    }
+ #endif /* IPFIREWALL_FORWARD */
+ 		break;
+ 
+diff --git a/sys/netinet/ipfw/ip_fw_private.h b/sys/netinet/ipfw/ip_fw_private.h
+index 8806821..a9e1ea2 100644
+--- a/sys/netinet/ipfw/ip_fw_private.h
++++ b/sys/netinet/ipfw/ip_fw_private.h
+@@ -124,6 +124,7 @@ struct ip_fw_args {
+ 	struct mbuf	*m;		/* the mbuf chain		*/
+ 	struct ifnet	*oif;		/* output interface		*/
+ 	struct sockaddr_in *next_hop;	/* forward address		*/
++	struct sockaddr_in6 *next_hop6; /* ipv6 forward address		*/
+ 
+ 	/*
+ 	 * On return, it points to the matching rule.
+diff --git a/sys/netinet/ipfw/ip_fw_sockopt.c b/sys/netinet/ipfw/ip_fw_sockopt.c
+index 2b92aec..7c1bd69 100644
+--- a/sys/netinet/ipfw/ip_fw_sockopt.c
++++ b/sys/netinet/ipfw/ip_fw_sockopt.c
+@@ -716,6 +716,17 @@ check_ipfw_struct(struct ip_fw *rule, int size)
+ 			return EINVAL;
+ #endif
+ 
++#ifdef INET6
++		case O_FORWARD_IP6:
++#ifdef IPFIREWALL_FORWARD
++			if (cmdlen != F_INSN_SIZE(ipfw_insn_sa6))
++				goto bad_size;
++			goto check_action;
++#else
++			return (EINVAL);
++#endif
++#endif /* INET6 */
++
+ 		case O_DIVERT:
+ 		case O_TEE:
+ 			if (ip_divert_ptr == NULL)
+diff --git a/sys/netinet/tcp_input.c b/sys/netinet/tcp_input.c
+index 4bfbf6a..bcc444d 100644
+--- a/sys/netinet/tcp_input.c
++++ b/sys/netinet/tcp_input.c
+@@ -761,8 +761,47 @@ findpcb:
+ 	 * Grab info from PACKET_TAG_IPFORWARD tag prepended to the chain.
+ 	 */
+ 	fwd_tag = m_tag_find(m, PACKET_TAG_IPFORWARD, NULL);
++#endif /* IPFIREWALL_FORWARD */
++  
++#ifdef INET6
++#ifdef IPFIREWALL_FORWARD
++	if (isipv6 && fwd_tag != NULL) {
++		struct sockaddr_in6 *next_hop6;
+ 
+-	if (fwd_tag != NULL && isipv6 == 0) {	/* IPv6 support is not yet */
++		next_hop6 = (struct sockaddr_in6 *)(fwd_tag + 1);
++		/*
++		 * Transparently forwarded. Pretend to be the destination.
++		 * Already got one like this?
++		 */
++		inp = in6_pcblookup_hash(&V_tcbinfo,
++		    &ip6->ip6_src, th->th_sport, &ip6->ip6_dst, th->th_dport,
++		    0, m->m_pkthdr.rcvif);
++		if (!inp) {
++			/*
++			 * It's new.  Try to find the ambushing socket.
++			 */
++			inp = in6_pcblookup_hash(&V_tcbinfo, &ip6->ip6_src,
++			    th->th_sport, &next_hop6->sin6_addr,
++			    next_hop6->sin6_port ? ntohs(next_hop6->sin6_port) :
++			    th->th_dport, INPLOOKUP_WILDCARD,
++			    m->m_pkthdr.rcvif);
++		}
++		/* Remove the tag from the packet.  We don't need it anymore. */
++		m_tag_delete(m, fwd_tag);
++	} else
++#endif /* IPFIREWALL_FORWARD */
++	if (isipv6) {
++		inp = in6_pcblookup_hash(&V_tcbinfo, &ip6->ip6_src,
++		    th->th_sport, &ip6->ip6_dst, th->th_dport,
++		    INPLOOKUP_WILDCARD, m->m_pkthdr.rcvif);
++	}
++#endif /* INET6 */
++#if defined(INET6) && defined(INET)
++	else
++#endif
++#ifdef INET
++#ifdef IPFIREWALL_FORWARD
++	if (fwd_tag != NULL) {
+ 		struct sockaddr_in *next_hop;
+ 
+ 		next_hop = (struct sockaddr_in *)(fwd_tag+1);
+@@ -789,22 +828,10 @@ findpcb:
+ 		m_tag_delete(m, fwd_tag);
+ 	} else
+ #endif /* IPFIREWALL_FORWARD */
+-	{
+-		if (isipv6) {
+-#ifdef INET6
+-			inp = in6_pcblookup_hash(&V_tcbinfo,
+-						 &ip6->ip6_src, th->th_sport,
+-						 &ip6->ip6_dst, th->th_dport,
+-						 INPLOOKUP_WILDCARD,
+-						 m->m_pkthdr.rcvif);
+-#endif
+-		} else
+-			inp = in_pcblookup_hash(&V_tcbinfo,
+-						ip->ip_src, th->th_sport,
+-						ip->ip_dst, th->th_dport,
+-						INPLOOKUP_WILDCARD,
+-						m->m_pkthdr.rcvif);
+-	}
++#endif /* INET */
++		inp = in_pcblookup_hash(&V_tcbinfo, ip->ip_src, th->th_sport,
++		    ip->ip_dst, th->th_dport, INPLOOKUP_WILDCARD,
++		    m->m_pkthdr.rcvif);
+ 
+ 	/*
+ 	 * If the INPCB does not exist then all data in the incoming
+diff --git a/sys/netinet/udp_usrreq.c b/sys/netinet/udp_usrreq.c
+index dc663bd..bbdd6b0 100644
+--- a/sys/netinet/udp_usrreq.c
++++ b/sys/netinet/udp_usrreq.c
+@@ -446,28 +446,6 @@ udp_input(struct mbuf *m, int off)
+ 	} else
+ 		UDPSTAT_INC(udps_nosum);
+ 
+-#ifdef IPFIREWALL_FORWARD
+-	/*
+-	 * Grab info from PACKET_TAG_IPFORWARD tag prepended to the chain.
+-	 */
+-	fwd_tag = m_tag_find(m, PACKET_TAG_IPFORWARD, NULL);
+-	if (fwd_tag != NULL) {
+-		struct sockaddr_in *next_hop;
+-
+-		/*
+-		 * Do the hack.
+-		 */
+-		next_hop = (struct sockaddr_in *)(fwd_tag + 1);
+-		ip->ip_dst = next_hop->sin_addr;
+-		uh->uh_dport = ntohs(next_hop->sin_port);
+-
+-		/*
+-		 * Remove the tag from the packet.  We don't need it anymore.
+-		 */
+-		m_tag_delete(m, fwd_tag);
+-	}
+-#endif
+-
+ 	INP_INFO_RLOCK(&V_udbinfo);
+ 	if (IN_MULTICAST(ntohl(ip->ip_dst.s_addr)) ||
+ 	    in_broadcast(ip->ip_dst, ifp)) {
+@@ -587,8 +565,37 @@ udp_input(struct mbuf *m, int off)
+ 	/*
+ 	 * Locate pcb for datagram.
+ 	 */
+-	inp = in_pcblookup_hash(&V_udbinfo, ip->ip_src, uh->uh_sport,
+-	    ip->ip_dst, uh->uh_dport, 1, ifp);
++#ifdef IPFIREWALL_FORWARD
++	/*
++	 * Grab info from PACKET_TAG_IPFORWARD tag prepended to the chain.
++	 */
++	fwd_tag = m_tag_find(m, PACKET_TAG_IPFORWARD, NULL);
++	if (fwd_tag != NULL) {
++		struct sockaddr_in *next_hop;
++
++		next_hop = (struct sockaddr_in *)(fwd_tag + 1);
++
++		/*
++		 * Transparently forwarded. Pretend to be the destination.
++		 * Already got one like this?
++		 */
++		inp = in_pcblookup_hash(&V_udbinfo, ip->ip_src, uh->uh_sport,
++		    ip->ip_dst, uh->uh_dport, 0, ifp);
++		if (!inp) {
++			/*
++			 * It's new.  Try to find the ambushing socket.
++			 */
++			inp = in_pcblookup_hash(&V_udbinfo, ip->ip_src,
++			    uh->uh_sport, next_hop->sin_addr,
++			    next_hop->sin_port ? htons(next_hop->sin_port) :
++			    uh->uh_dport, INPLOOKUP_WILDCARD, ifp);
++		}
++		/* Remove the tag from the packet. We don't need it anymore. */
++		m_tag_delete(m, fwd_tag);
++	} else
++#endif /* IPFIREWALL_FORWARD */
++		inp = in_pcblookup_hash(&V_udbinfo, ip->ip_src, uh->uh_sport,
++		    ip->ip_dst, uh->uh_dport, INPLOOKUP_WILDCARD, ifp);
+ 	if (inp == NULL) {
+ 		if (udp_log_in_vain) {
+ 			char buf[4*sizeof "123"];
+diff --git a/sys/netinet6/in6.c b/sys/netinet6/in6.c
+index b4659ec..f755e5f 100644
+--- a/sys/netinet6/in6.c
++++ b/sys/netinet6/in6.c
+@@ -1983,6 +1983,26 @@ in6_localaddr(struct in6_addr *in6)
+ 	return (0);
+ }
+ 
++/*
++ * Return 1 if an internet address is for the local host and configured
++ * on one of its interfaces.
++ */
++int
++in6_localip(struct in6_addr *in6)
++{
++	struct in6_ifaddr *ia;
++
++	IN6_IFADDR_RLOCK();
++	TAILQ_FOREACH(ia, &V_in6_ifaddrhead, ia_link) {
++		if (IN6_ARE_ADDR_EQUAL(in6, &ia->ia_addr.sin6_addr)) {
++			IN6_IFADDR_RUNLOCK();
++			return (1);
++		}
++	}
++	IN6_IFADDR_RUNLOCK();
++	return (0);
++}
++
+ int
+ in6_is_addr_deprecated(struct sockaddr_in6 *sa6)
+ {
+diff --git a/sys/netinet6/in6.h b/sys/netinet6/in6.h
+index bfca317..cd6cd74 100644
+--- a/sys/netinet6/in6.h
++++ b/sys/netinet6/in6.h
+@@ -628,6 +628,7 @@ struct cmsghdr;
+ 
+ int	in6_cksum __P((struct mbuf *, u_int8_t, u_int32_t, u_int32_t));
+ int	in6_localaddr __P((struct in6_addr *));
++int	in6_localip(struct in6_addr *);
+ int	in6_addrscope __P((struct in6_addr *));
+ struct	in6_ifaddr *in6_ifawithifp __P((struct ifnet *, struct in6_addr *));
+ extern void in6_if_up __P((struct ifnet *));
+diff --git a/sys/netinet6/ip6_forward.c b/sys/netinet6/ip6_forward.c
+index 3ea71cd..7b69fc8 100644
+--- a/sys/netinet6/ip6_forward.c
++++ b/sys/netinet6/ip6_forward.c
+@@ -34,6 +34,7 @@ __FBSDID("$FreeBSD: src/sys/netinet6/ip6_forward.c,v 1.51.2.2.6.2 2012/11/17 08:
+ 
+ #include "opt_inet.h"
+ #include "opt_inet6.h"
++#include "opt_ipfw.h"
+ #include "opt_ipsec.h"
+ #include "opt_ipstealth.h"
+ 
+@@ -50,6 +51,7 @@ __FBSDID("$FreeBSD: src/sys/netinet6/ip6_forward.c,v 1.51.2.2.6.2 2012/11/17 08:
+ #include <sys/syslog.h>
+ 
+ #include <net/if.h>
++#include <net/netisr.h>
+ #include <net/route.h>
+ #include <net/pfil.h>
+ 
+@@ -98,11 +100,17 @@ ip6_forward(struct mbuf *m, int srcrt)
+ 	struct mbuf *mcopy = NULL;
+ 	struct ifnet *origifp;	/* maybe unnecessary */
+ 	u_int32_t inzone, outzone;
+-	struct in6_addr src_in6, dst_in6;
++	struct in6_addr src_in6, dst_in6, odst;
+ #ifdef IPSEC
+ 	struct secpolicy *sp = NULL;
+ 	int ipsecrt = 0;
+ #endif
++#ifdef SCTP
++	int sw_csum;
++#endif
++#ifdef IPFIREWALL_FORWARD
++	struct m_tag *fwd_tag;
++#endif
+ 	char ip6bufs[INET6_ADDRSTRLEN], ip6bufd[INET6_ADDRSTRLEN];
+ 
+ #ifdef IPSEC
+@@ -345,13 +353,15 @@ ip6_forward(struct mbuf *m, int srcrt)
+ 		goto skip_routing;
+ skip_ipsec:
+ #endif
+-
++again:
+ 	bzero(&rin6, sizeof(struct route_in6));
+ 	dst = (struct sockaddr_in6 *)&rin6.ro_dst;
+ 	dst->sin6_len = sizeof(struct sockaddr_in6);
+ 	dst->sin6_family = AF_INET6;
+ 	dst->sin6_addr = ip6->ip6_dst;
+-
++#ifdef IPFIREWALL_FORWARD
++again2:
++#endif
+ 	rin6.ro_rt = rtalloc1((struct sockaddr *)dst, 0, 0);
+ 	if (rin6.ro_rt != NULL)
+ 		RT_UNLOCK(rin6.ro_rt);
+@@ -554,6 +564,7 @@ skip_routing:
+ 	if (!PFIL_HOOKED(&V_inet6_pfil_hook))
+ 		goto pass;
+ 
++	odst = ip6->ip6_dst;
+ 	/* Run through list of hooks for output packets. */
+ 	error = pfil_run_hooks(&V_inet6_pfil_hook, &m, rt->rt_ifp, PFIL_OUT, NULL);
+ 	if (error != 0)
+@@ -562,6 +573,59 @@ skip_routing:
+ 		goto freecopy;
+ 	ip6 = mtod(m, struct ip6_hdr *);
+ 
++	/* See if destination IP address was changed by packet filter. */
++	if (!IN6_ARE_ADDR_EQUAL(&odst, &ip6->ip6_dst)) {
++		m->m_flags |= M_SKIP_FIREWALL;
++		/* If destination is now ourself drop to ip6_input(). */
++		if (in6_localip(&ip6->ip6_dst)) {
++			m->m_flags |= M_FASTFWD_OURS;
++			if (m->m_pkthdr.rcvif == NULL)
++				m->m_pkthdr.rcvif = V_loif;
++			if (m->m_pkthdr.csum_flags & CSUM_DELAY_DATA) {
++				m->m_pkthdr.csum_flags |=
++				    CSUM_DATA_VALID | CSUM_PSEUDO_HDR;
++				m->m_pkthdr.csum_data = 0xffff;
++			}
++			m->m_pkthdr.csum_flags |=
++			    CSUM_IP_CHECKED | CSUM_IP_VALID;
++#ifdef SCTP
++			if (m->m_pkthdr.csum_flags & CSUM_SCTP)
++				m->m_pkthdr.csum_flags |= CSUM_SCTP_VALID;
++#endif
++			error = netisr_queue(NETISR_IPV6, m);
++			goto out;
++		} else
++			goto again;	/* Redo the routing table lookup. */
++	}
++
++#ifdef IPFIREWALL_FORWARD
++	/* See if local, if yes, send it to netisr. */
++	if (m->m_flags & M_FASTFWD_OURS) {
++		if (m->m_pkthdr.rcvif == NULL)
++			m->m_pkthdr.rcvif = V_loif;
++		if (m->m_pkthdr.csum_flags & CSUM_DELAY_DATA) {
++			m->m_pkthdr.csum_flags |=
++			    CSUM_DATA_VALID | CSUM_PSEUDO_HDR;
++			m->m_pkthdr.csum_data = 0xffff;
++		}
++#ifdef SCTP
++		if (m->m_pkthdr.csum_flags & CSUM_SCTP)
++		m->m_pkthdr.csum_flags |= CSUM_SCTP_VALID;
++#endif   
++		error = netisr_queue(NETISR_IPV6, m);
++		goto out;
++	}
++	/* Or forward to some other address? */
++	fwd_tag = m_tag_find(m, PACKET_TAG_IPFORWARD, NULL);
++	if (fwd_tag) {
++		dst = (struct sockaddr_in6 *)&rin6.ro_dst;
++		bcopy((fwd_tag+1), dst, sizeof(struct sockaddr_in6));
++		m->m_flags |= M_SKIP_FIREWALL;
++		m_tag_delete(m, fwd_tag);
++		goto again2;
++	}
++#endif /* IPFIREWALL_FORWARD */
++
+ pass:
+ 	error = nd6_output(rt->rt_ifp, origifp, m, dst, rt);
+ 	if (error) {
+diff --git a/sys/netinet6/ip6_input.c b/sys/netinet6/ip6_input.c
+index 858dcfe..79b6f60 100644
+--- a/sys/netinet6/ip6_input.c
++++ b/sys/netinet6/ip6_input.c
+@@ -65,6 +65,7 @@ __FBSDID("$FreeBSD: src/sys/netinet6/ip6_input.c,v 1.132.2.6.4.3 2012/11/17 08:2
+ 
+ #include "opt_inet.h"
+ #include "opt_inet6.h"
++#include "opt_ipfw.h"
+ #include "opt_ipsec.h"
+ 
+ #include <sys/param.h>
+@@ -90,6 +91,7 @@ __FBSDID("$FreeBSD: src/sys/netinet6/ip6_input.c,v 1.132.2.6.4.3 2012/11/17 08:2
+ #include <net/vnet.h>
+ 
+ #include <netinet/in.h>
++#include <netinet/ip_var.h>
+ #include <netinet/in_systm.h>
+ #include <net/if_llatbl.h>
+ #ifdef INET
+@@ -338,6 +340,17 @@ ip6_input(struct mbuf *m)
+ 	 */
+ 	ip6_delaux(m);
+ 
++	if (m->m_flags & M_FASTFWD_OURS) {
++		/*
++		 * Firewall changed destination to local.
++		 */
++		m->m_flags &= ~M_FASTFWD_OURS;
++		ours = 1;
++		deliverifp = m->m_pkthdr.rcvif;
++		ip6 = mtod(m, struct ip6_hdr *);
++		goto hbhcheck;
++	}
++
+ 	/*
+ 	 * mbuf statistics
+ 	 */
+@@ -507,6 +520,24 @@ ip6_input(struct mbuf *m)
+ 	ip6 = mtod(m, struct ip6_hdr *);
+ 	srcrt = !IN6_ARE_ADDR_EQUAL(&odst, &ip6->ip6_dst);
+ 
++#ifdef IPFIREWALL_FORWARD
++	if (m->m_flags & M_FASTFWD_OURS) {
++		m->m_flags &= ~M_FASTFWD_OURS;
++		ours = 1;
++		deliverifp = m->m_pkthdr.rcvif;
++		goto hbhcheck;
++	}
++	if (m_tag_find(m, PACKET_TAG_IPFORWARD, NULL) != NULL) {
++		/*
++		 * Directly ship the packet on.  This allows forwarding
++		 * packets originally destined to us to some other directly
++		 * connected host.
++		 */
++		ip6_forward(m, 1);
++		goto out;
++	}
++#endif /* IPFIREWALL_FORWARD */
++
+ passin:
+ 	/*
+ 	 * Disambiguate address scope zones (if there is ambiguity).
+diff --git a/sys/netinet6/ip6_output.c b/sys/netinet6/ip6_output.c
+index 46a7741..0fcb3f5 100644
+--- a/sys/netinet6/ip6_output.c
++++ b/sys/netinet6/ip6_output.c
+@@ -65,6 +65,7 @@ __FBSDID("$FreeBSD: src/sys/netinet6/ip6_output.c,v 1.137.2.5.4.3 2012/11/17 08:
+ 
+ #include "opt_inet.h"
+ #include "opt_inet6.h"
++#include "opt_ipfw.h"
+ #include "opt_ipsec.h"
+ #include "opt_sctp.h"
+ 
+@@ -89,6 +90,7 @@ __FBSDID("$FreeBSD: src/sys/netinet6/ip6_output.c,v 1.137.2.5.4.3 2012/11/17 08:
+ 
+ #include <netinet/in.h>
+ #include <netinet/in_var.h>
++#include <netinet/ip_var.h>
+ #include <netinet6/in6_var.h>
+ #include <netinet/ip6.h>
+ #include <netinet/icmp6.h>
+@@ -225,6 +227,9 @@ ip6_output(struct mbuf *m0, struct ip6_pktopts *opt,
+ 	int segleft_org = 0;
+ 	struct secpolicy *sp = NULL;
+ #endif /* IPSEC */
++#ifdef IPFIREWALL_FORWARD
++	struct m_tag *fwd_tag;
++#endif
+ 
+ 	ip6 = mtod(m, struct ip6_hdr *);
+ 	if (ip6 == NULL) {
+@@ -851,7 +856,8 @@ again:
+ 	if (!IN6_ARE_ADDR_EQUAL(&odst, &ip6->ip6_dst)) {
+ 		m->m_flags |= M_SKIP_FIREWALL;
+ 		/* If destination is now ourself drop to ip6_input(). */
+-		if (in6_localaddr(&ip6->ip6_dst)) {
++		if (in6_localip(&ip6->ip6_dst)) {
++			m->m_flags |= M_FASTFWD_OURS;
+ 			if (m->m_pkthdr.rcvif == NULL)
+ 				m->m_pkthdr.rcvif = V_loif;
+ 			if (m->m_pkthdr.csum_flags & CSUM_DELAY_DATA) {
+@@ -871,7 +877,33 @@ again:
+ 			goto again;	/* Redo the routing table lookup. */
+ 	}
+ 
+-	/* XXX: IPFIREWALL_FORWARD */
++#ifdef IPFIREWALL_FORWARD
++	/* See if local, if yes, send it to netisr. */
++	if (m->m_flags & M_FASTFWD_OURS) {
++		if (m->m_pkthdr.rcvif == NULL)
++			m->m_pkthdr.rcvif = V_loif;
++		if (m->m_pkthdr.csum_flags & CSUM_DELAY_DATA) {
++			m->m_pkthdr.csum_flags |=
++			    CSUM_DATA_VALID | CSUM_PSEUDO_HDR;
++			m->m_pkthdr.csum_data = 0xffff;
++		}
++#ifdef SCTP
++		if (m->m_pkthdr.csum_flags & CSUM_SCTP)
++		m->m_pkthdr.csum_flags |= CSUM_SCTP_VALID;
++#endif   
++		error = netisr_queue(NETISR_IPV6, m);
++		goto done;
++	}
++	/* Or forward to some other address? */
++	fwd_tag = m_tag_find(m, PACKET_TAG_IPFORWARD, NULL);
++	if (fwd_tag) {
++		dst = (struct sockaddr_in6 *)&ro->ro_dst;
++		bcopy((fwd_tag+1), dst, sizeof(struct sockaddr_in6));
++		m->m_flags |= M_SKIP_FIREWALL;
++		m_tag_delete(m, fwd_tag);
++		goto again;
++	}
++#endif /* IPFIREWALL_FORWARD */
+ 
+ passout:
+ 	/*
+diff --git a/sys/netinet6/udp6_usrreq.c b/sys/netinet6/udp6_usrreq.c
+index fe4cdac..afab876 100644
+--- a/sys/netinet6/udp6_usrreq.c
++++ b/sys/netinet6/udp6_usrreq.c
+@@ -67,6 +67,7 @@ __FBSDID("$FreeBSD: src/sys/netinet6/udp6_usrreq.c,v 1.115.2.4.2.2 2012/11/17 08
+ 
+ #include "opt_inet.h"
+ #include "opt_inet6.h"
++#include "opt_ipfw.h"
+ #include "opt_ipsec.h"
+ 
+ #include <sys/param.h>
+@@ -177,6 +178,9 @@ udp6_input(struct mbuf **mp, int *offp, int proto)
+ 	int off = *offp;
+ 	int plen, ulen;
+ 	struct sockaddr_in6 fromsa;
++#ifdef IPFIREWALL_FORWARD
++	struct m_tag *fwd_tag;
++#endif
+ 
+ 	ifp = m->m_pkthdr.rcvif;
+ 	ip6 = mtod(m, struct ip6_hdr *);
+@@ -366,8 +370,40 @@ udp6_input(struct mbuf **mp, int *offp, int proto)
+ 	/*
+ 	 * Locate pcb for datagram.
+ 	 */
+-	inp = in6_pcblookup_hash(&V_udbinfo, &ip6->ip6_src, uh->uh_sport,
+-	    &ip6->ip6_dst, uh->uh_dport, 1, m->m_pkthdr.rcvif);
++#ifdef IPFIREWALL_FORWARD
++	/*
++	 * Grab info from PACKET_TAG_IPFORWARD tag prepended to the chain.
++	 */
++	fwd_tag = m_tag_find(m, PACKET_TAG_IPFORWARD, NULL);
++	if (fwd_tag != NULL) {
++		struct sockaddr_in6 *next_hop6;
++
++		next_hop6 = (struct sockaddr_in6 *)(fwd_tag + 1);
++
++		/*
++		 * Transparently forwarded. Pretend to be the destination.
++		 * Already got one like this?
++		 */
++		inp = in6_pcblookup_hash(&V_udbinfo,
++		    &ip6->ip6_src, uh->uh_sport, &ip6->ip6_dst, uh->uh_dport,
++		    0, m->m_pkthdr.rcvif);
++		if (!inp) {
++			/*
++			 * It's new.  Try to find the ambushing socket.
++			 */
++			inp = in6_pcblookup_hash(&V_udbinfo, &ip6->ip6_src,
++			    uh->uh_sport, &next_hop6->sin6_addr,
++			    next_hop6->sin6_port ? htons(next_hop6->sin6_port) :
++			    uh->uh_dport, INPLOOKUP_WILDCARD,
++			    m->m_pkthdr.rcvif);
++		}
++		/* Remove the tag from the packet. We don't need it anymore. */
++		m_tag_delete(m, fwd_tag);
++	} else
++#endif /* IPFIREWALL_FORWARD */
++		inp = in6_pcblookup_hash(&V_udbinfo, &ip6->ip6_src,
++		    uh->uh_sport, &ip6->ip6_dst, uh->uh_dport,
++		    INPLOOKUP_WILDCARD, m->m_pkthdr.rcvif);
+ 	if (inp == NULL) {
+ 		if (udp_log_in_vain) {
+ 			char ip6bufs[INET6_ADDRSTRLEN];

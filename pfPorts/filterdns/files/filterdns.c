@@ -31,6 +31,8 @@
 #include <sys/refcount.h>
 #include <sys/queue.h>
 
+#include <stddef.h>	/* offsetof */
+
 #include <net/if.h>
 #include <net/pfvar.h>
 #include <netinet/in.h>
@@ -231,16 +233,28 @@ host_dns(struct thread_data *hostd)
 static void
 ipfw_tableentry(struct thread_data *ipfwd, struct sockaddr *address, int action)
 {
-	ipfw_table_entry ent;
+	ipfw_table_xentry xent;
+	socklen_t size;
+	ip_fw3_opheader *op3;
+	size_t addrlen;
 	static int s = -1;
-
-	if (address->sa_family != AF_INET) /* XXX */
+	
+	memset(&xent, 0, sizeof(xent));
+	xent.masklen = ipfwd->mask;
+	xent.tbl = ipfwd->tablenr;
+	
+	if (address->sa_family == AF_INET) {
+		addrlen = sizeof(struct in_addr);
+		memcpy(&xent.k, &satosin(address)->sin_addr, addrlen);
+	} else if (address->sa_family == AF_INET6) {
+		addrlen = sizeof(struct in6_addr);
+		xent.k.addr6 = satosin6(address)->sin6_addr;
+	} else
 		return;
-	bzero(&ent, sizeof(ent));
-	ent.masklen = ipfwd->mask;
-	ent.tbl = ipfwd->tablenr;
-	ent.addr = satosin(address)->sin_addr.s_addr;
-	ent.value = ipfwd->pipe; /* XXX */
+	
+	xent.value = ipfwd->pipe; /* XXX */
+	xent.type = IPFW_TABLE_CIDR;
+	xent.len = offsetof(ipfw_table_xentry, k) + addrlen;
 
 	if (s == -1)
 		s = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
@@ -252,7 +266,15 @@ ipfw_tableentry(struct thread_data *ipfwd, struct sockaddr *address, int action)
 #endif
 	if (ipfwctx != NULL)
 		setsockopt(s, IPPROTO_IP, IP_FW_CTX_SET, (void *)ipfwctx, strlen(ipfwctx));
-	setsockopt(s, IPPROTO_IP, action == ADD ? IP_FW_TABLE_ADD : IP_FW_TABLE_DEL, (void *)&ent, sizeof(ent));
+	
+	size = sizeof(ip_fw3_opheader) + sizeof(ipfw_table_xentry);
+	op3 = alloca(size);
+	/* Zero reserved fields */
+	memset(op3, 0, sizeof(ip_fw3_opheader));
+	memcpy(op3 + 1, &xent, sizeof(ipfw_table_xentry));
+	op3->opcode = (action == ADD) ? IP_FW_TABLE_XADD : IP_FW_TABLE_XDEL;
+	
+	setsockopt(s, IPPROTO_IP, IP_FW3, op3, size);
 }
 
 static void

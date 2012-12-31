@@ -22,7 +22,9 @@
 ~~ipsec_wrong_check.RELENG_8.diff~
 ~~ipsec_altq.RELENG_8.diff~
 ~~ipfw_dummynet_bandwidth.diff~
+-p1~~from-8-STABLE/ipfw/0001-MFC-r232865-r232868-and-r233478.patch~
 -p1~~CP_speedup.diff~
+-p1~~CP_multi_instance_ipfw.diff~
 ~sys/modules/ipfw~ipfw.diff~
 ~sys/netgraph~ng_iface.RELENG_8.diff~
 ~~ng_eiface.RELENG_8.diff~
@@ -83,7 +85,6 @@
 -p1~~pf_route-to-crash_fixes.diff~
 -p1~~pf_802.1p.diff~
 -p1~~pf_print_state_queue.diff~
--p1~~CP_multi_instance_ipfw.diff~
 ~sys~carpv6-4.diff~
 ~~ath_9-STABLE.tgz~
 ~sys/conf~ath_conf_files.diff~
@@ -106,3 +107,4 @@
 -p1~~from-8-STABLE/virtio/0001-MFC-r227652-r228301-r234270-r234349.patch~
 ~~sfxge.tgz~
 -p1~~vfs_subr_mount_RO.diff~
+-p1~~ipfw_forward_ipv6.diff~

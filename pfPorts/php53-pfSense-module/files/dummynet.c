@@ -155,13 +155,12 @@ do_cmd(int optname, void *optval, uintptr_t optlen)
                 return (-1);
 
         if (optname == IP_FW_GET || optname == IP_DUMMYNET_GET ||
-            optname == IP_FW_ADD || optname == IP_FW_TABLE_LIST ||
+            optname == IP_FW_ADD || optname == IP_FW3 ||
+            optname == IP_FW_TABLE_LIST || 
             optname == IP_FW_TABLE_GETSIZE ||
             optname == IP_FW_NAT_GET_CONFIG ||
             optname < 0 ||
-            optname == IP_FW_NAT_GET_LOG ||
-            optname == IP_FW_TABLE_GET_ENTRY ||
-            optname == IP_FW_TABLE_ZERO_ENTRY_STATS) {
+            optname == IP_FW_NAT_GET_LOG) {
                 if (optname < 0)
                         optname = -optname;
                 i = getsockopt(PFSENSE_G(ipfw), IPPROTO_IP, optname, optval,
